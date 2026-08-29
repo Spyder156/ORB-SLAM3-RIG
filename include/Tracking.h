@@ -29,6 +29,7 @@
 #include "LocalMapping.h"
 #include "LoopClosing.h"
 #include "Frame.h"
+#include "LineExtractor.h"
 #include "ORBVocabulary.h"
 #include "KeyFrameDatabase.h"
 #include "ORBextractor.h"
@@ -72,6 +73,14 @@ public:
     Sophus::SE3f GrabImageStereo(const cv::Mat &imRectLeft,const cv::Mat &imRectRight, const double &timestamp, string filename);
     Sophus::SE3f GrabImageRGBD(const cv::Mat &imRGB,const cv::Mat &imD, const double &timestamp, string filename);
     Sophus::SE3f GrabImageMonocular(const cv::Mat &im, const double &timestamp, string filename);
+
+    /// Experiment B: two non-overlapping cameras on the MONOCULAR path.
+    /// Both images are extracted into one Frame (descriptors pooled, which is
+    /// also what cross-lens BoW needs), with a ZERO-translation Tlr so the rig
+    /// carries only its scale-free rotation until the map is metric.
+    /// See SLAM/patches/orbslam3_rigB/README.md
+    Sophus::SE3f GrabImageMonoRig(const cv::Mat &im0, const cv::Mat &im1,
+                                  const double &timestamp, string filename);
 
     void GrabImuData(const IMU::Point &imuMeasurement);
 
@@ -260,6 +269,24 @@ protected:
     //ORB
     ORBextractor* mpORBextractorLeft, *mpORBextractorRight;
     ORBextractor* mpIniORBextractor;
+    // Rear-camera init extractor. Upstream only builds an init (5x features)
+    // extractor for the LEFT camera, so on a rig the front contributes ~12500
+    // features during initialisation and the rear only 2500 -- the map is then
+    // built almost entirely from one lens.
+    ORBextractor* mpIniORBextractorRight = nullptr;
+
+    // Spherical line features. Enabled by Lines.enabled in the settings file;
+    // when off, nothing below runs and behaviour is bit-identical to before.
+    LineExtractor* mpLineExtractor = nullptr;
+    bool mbUseLines = false;
+    std::vector<LineObs> mvPrevLines;      ///< previous frame, for tracking
+    long mnLineMatches = 0, mnLineTotal = 0, mnLineTriangulated = 0;
+    long mnLineObs = 0, mnLineRej = 0;
+
+    /// Minimum inliers before a visual update may override IMU propagation
+    /// while RECENTLY_LOST. Upstream hardcodes 10.
+    int mnRecentlyLostMinInliers = 10;
+    std::vector<int> mvLineAssign;   ///< cur->prev line match, computed pre-Track()
 
     //BoW
     ORBVocabulary* mpORBVocabulary;
@@ -356,6 +383,10 @@ protected:
     Sophus::SE3f mTlr;
 
     void newParameterLoader(Settings* settings);
+
+    // path of the settings yaml, so newParameterLoader can read extra keys
+    // (e.g. Camera1.mask) that Settings does not expose
+    std::string mStrSettingPath;
 
 #ifdef REGISTER_LOOP
     bool Stop();

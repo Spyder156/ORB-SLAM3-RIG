@@ -18,6 +18,8 @@
 
 
 #include "Tracking.h"
+#include "MapLine.h"
+#include "Rig.h"
 
 #include "ORBmatcher.h"
 #include "FrameDrawer.h"
@@ -49,6 +51,7 @@ Tracking::Tracking(System *pSys, ORBVocabulary* pVoc, FrameDrawer *pFrameDrawer,
     mnInitialFrameId(0), mbCreatedMap(false), mnFirstFrameId(0), mpCamera2(nullptr), mpLastKeyFrame(static_cast<KeyFrame*>(NULL))
 {
     // Load camera parameters from settings file
+    mStrSettingPath = strSettingPath;
     if(settings){
         newParameterLoader(settings);
     }
@@ -558,14 +561,29 @@ void Tracking::newParameterLoader(Settings *settings) {
     mK_(0,2) = mpCamera->getParameter(2);
     mK_(1,2) = mpCamera->getParameter(3);
 
-    if((mSensor==System::STEREO || mSensor==System::IMU_STEREO || mSensor==System::IMU_RGBD) &&
-        settings->cameraType() == Settings::KannalaBrandt){
+    // Experiment B: a non-overlapping rig on the MONO path also needs camera 2.
+    // settings->camera2() is only non-null when Settings read it, which its own
+    // gate now allows when Rig.enabled=1.
+    const bool bRigOnMono = mpSystem->mRig.IsEnabled() &&
+                            (mSensor==System::MONOCULAR || mSensor==System::IMU_MONOCULAR);
+    if((mSensor==System::STEREO || mSensor==System::IMU_STEREO || mSensor==System::IMU_RGBD
+        || bRigOnMono) && settings->cameraType() == Settings::KannalaBrandt){
         mpCamera2 = settings->camera2();
+        if(!mpCamera2){
+            std::cerr << "[Debug] Tracking FATAL: camera2 requested but Settings "
+                         "returned null -- Camera2.* missing from the yaml" << std::endl;
+            exit(-1);
+        }
         mpCamera2 = mpAtlas->AddCamera(mpCamera2);
 
         mTlr = settings->Tlr();
 
         mpFrameDrawer->both = true;
+        std::cout << "[Debug] Tracking: camera2 attached"
+                  << (bRigOnMono ? " (MONO-RIG path, Experiment B)" : " (stereo path)")
+                  << "; Settings Tlr baseline = " << mTlr.translation().norm()
+                  << " m -- NOTE GrabImageMonoRig overrides this with the "
+                     "zero/phase-aware baseline" << std::endl;
     }
 
     if(mSensor==System::STEREO || mSensor==System::RGBD || mSensor==System::IMU_STEREO || mSensor==System::IMU_RGBD ){
@@ -594,11 +612,86 @@ void Tracking::newParameterLoader(Settings *settings) {
 
     mpORBextractorLeft = new ORBextractor(nFeatures,fScaleFactor,nLevels,fIniThFAST,fMinThFAST);
 
-    if(mSensor==System::STEREO || mSensor==System::IMU_STEREO)
+    // Experiment B also needs the second extractor on the MONO path: the rig
+    // Frame constructor extracts BOTH images. Without this mpORBextractorRight
+    // is NULL and Frame's right-extraction thread dereferences it -- a silent
+    // crash inside a std::thread, with no error printed at all.
+    if(mSensor==System::STEREO || mSensor==System::IMU_STEREO || mpSystem->mRig.IsEnabled())
         mpORBextractorRight = new ORBextractor(nFeatures,fScaleFactor,nLevels,fIniThFAST,fMinThFAST);
+    {   // ---- how hard the IMU should carry a visual dropout ----
+        cv::FileStorage tfs(mStrSettingPath, cv::FileStorage::READ);
+        if(tfs.isOpened() && !tfs["Tracking.recentlyLostMinInliers"].empty())
+            mnRecentlyLostMinInliers = (int)tfs["Tracking.recentlyLostMinInliers"];
+        std::cout << "[Debug] Tracking: RECENTLY_LOST needs > "
+                  << mnRecentlyLostMinInliers << " inliers to trust vision"
+                  << std::endl;
+    }
+
+    {   // ---- spherical line features (off unless asked for) ----
+        cv::FileStorage lfs(mStrSettingPath, cv::FileStorage::READ);
+        mbUseLines = lfs.isOpened() && !lfs["Lines.enabled"].empty() &&
+                     ((int)lfs["Lines.enabled"] != 0);
+        if(mbUseLines){
+            const float minA = lfs["Lines.minAngLenDeg"].empty() ? 1.5f : (float)lfs["Lines.minAngLenDeg"];
+            const float maxA = lfs["Lines.maxAngLenDeg"].empty() ? 40.0f : (float)lfs["Lines.maxAngLenDeg"];
+            const int   gth  = lfs["Lines.gradThresh"].empty()   ? 30    : (int)lfs["Lines.gradThresh"];
+            const int   mpx  = lfs["Lines.minLenPx"].empty()     ? 15    : (int)lfs["Lines.minLenPx"];
+            mpLineExtractor = new LineExtractor(minA, maxA, gth, mpx);
+            for(int mc = 0; mc < 2; mc++){
+                char key[32]; snprintf(key, sizeof(key), "Lines.mask%d", mc);
+                if(lfs[key].empty() || !lfs[key].isString()) continue;
+                const std::string mp = (std::string)lfs[key];
+                cv::Mat mm = cv::imread(mp, cv::IMREAD_GRAYSCALE);
+                if(mm.empty()){
+                    std::cerr << "[Debug] Lines FATAL: cannot read mask " << mp << std::endl;
+                    exit(-1);
+                }
+                mpLineExtractor->SetMask(mc, mm);
+                std::cout << "[Debug] Lines: cam" << mc << " self-occlusion mask "
+                          << mp << "  " << 100.0*cv::countNonZero(mm)/mm.total()
+                          << "% ignored" << std::endl;
+            }
+            std::cout << "[Debug] Lines: ENABLED  minAng " << minA << " deg, maxAng "
+                      << maxA << " deg, grad " << gth << ", minLen " << mpx << " px"
+                      << std::endl;
+        } else {
+            std::cout << "[Debug] Lines: off" << std::endl;
+        }
+    }
+
+    if(mpSystem->mRig.IsEnabled()){
+        mpIniORBextractorRight = new ORBextractor(5*nFeatures,fScaleFactor,nLevels,fIniThFAST,fMinThFAST);
+        std::cout << "[Debug] Tracking: rear init extractor created (5x features), so both "
+                     "lenses contribute equally during initialisation" << std::endl;
+    }
+    if(mpSystem->mRig.IsEnabled() && mSensor!=System::STEREO && mSensor!=System::IMU_STEREO)
+        std::cout << "[Debug] Tracking: right ORB extractor created for the MONO-RIG path"
+                  << std::endl;
 
     if(mSensor==System::MONOCULAR || mSensor==System::IMU_MONOCULAR)
         mpIniORBextractor = new ORBextractor(5*nFeatures,fScaleFactor,nLevels,fIniThFAST,fMinThFAST);
+
+    // Optional validity mask (fisheye image circle). Read straight from the
+    // settings file: "Camera1.mask" / "Camera2.mask". NONZERO == MASKED.
+    {
+        cv::FileStorage fs(mStrSettingPath, cv::FileStorage::READ);
+        auto loadMask = [&](const char* key, ORBextractor* ex1, ORBextractor* ex2){
+            if(!fs.isOpened() || fs[key].empty() || !fs[key].isString()) return;
+            const std::string path = (std::string)fs[key];
+            cv::Mat m = cv::imread(path, cv::IMREAD_GRAYSCALE);
+            if(m.empty()){
+                std::cerr << "[Tracking] FATAL: could not read mask " << path << std::endl;
+                exit(-1);
+            }
+            if(ex1) ex1->SetMask(m);
+            if(ex2) ex2->SetMask(m);
+        };
+        loadMask("Camera1.mask", mpORBextractorLeft, mpIniORBextractor);
+        loadMask("Camera2.mask", mpORBextractorRight, nullptr);
+    }
+
+    Rig::Stage("tracking", "parameter load complete; rig consumers: frame construction, "
+                           "pose prediction, projection search");
 
     //IMU parameters
     Sophus::SE3f Tbc = settings->Tbc();
@@ -1562,6 +1655,193 @@ Sophus::SE3f Tracking::GrabImageRGBD(const cv::Mat &imRGB,const cv::Mat &imD, co
     return mCurrentFrame.GetPose();
 }
 
+
+
+Sophus::SE3f Tracking::GrabImageMonoRig(const cv::Mat &im0, const cv::Mat &im1,
+                                        const double &timestamp, string filename)
+{
+    static bool dbg = true;
+    mImGray = im0;
+    cv::Mat imGrayRight = im1;
+    auto toGray = [&](cv::Mat &m){
+        if(m.channels()==3)      cvtColor(m,m, mbRGB ? cv::COLOR_RGB2GRAY : cv::COLOR_BGR2GRAY);
+        else if(m.channels()==4) cvtColor(m,m, mbRGB ? cv::COLOR_RGBA2GRAY : cv::COLOR_BGRA2GRAY);
+    };
+    toGray(mImGray); toGray(imGrayRight);
+
+    if(dbg){
+        std::cout << "[Debug] MonoRig: im0 " << mImGray.cols << "x" << mImGray.rows
+                  << "  im1 " << imGrayRight.cols << "x" << imGrayRight.rows
+                  << "  mpCamera=" << (mpCamera?"set":"NULL")
+                  << "  mpCamera2=" << (mpCamera2?"set":"NULL") << std::endl;
+    }
+    if(!mpCamera2){
+        std::cerr << "[Debug] MonoRig FATAL: mpCamera2 is NULL -- Camera2.* missing "
+                     "from the settings file" << std::endl;
+        exit(-1);
+    }
+    if(!mpORBextractorRight){
+        // Frame's right-extraction runs in a std::thread; a null extractor there
+        // crashes silently with no message at all. Fail loudly here instead.
+        std::cerr << "[Debug] MonoRig FATAL: mpORBextractorRight is NULL" << std::endl;
+        exit(-1);
+    }
+
+    // Zero-translation rig transform. Rotation is scale-free and valid now;
+    // the baseline stays 0 map units until ReleaseBaseline() is called, because
+    // a metric 4.01 cm means nothing in an arbitrary-scale monocular map.
+    Sophus::SE3f Tlr(mpSystem->mRig.R_c0_c1(), mpSystem->mRig.BaselineMapUnits());
+    if(dbg){
+        std::cout << "[Debug] MonoRig: Tlr baseline = "
+                  << Tlr.translation().norm() << " map units, released="
+                  << (mpSystem->mRig.BaselineReleased() ? "yes" : "no (phase 1)")
+                  << std::endl;
+    }
+
+    const bool bInit = (mState==NOT_INITIALIZED || mState==NO_IMAGES_YET);
+    ORBextractor* ex  = bInit ? mpIniORBextractor : mpORBextractorLeft;
+    ORBextractor* exR = (bInit && mpIniORBextractorRight) ? mpIniORBextractorRight
+                                                          : mpORBextractorRight;
+    mCurrentFrame = Frame(mImGray, imGrayRight, timestamp, ex, exR,
+                          mpORBVocabulary, mK, mDistCoef, mbf, mThDepth,
+                          mpCamera, mpCamera2, Tlr, &mLastFrame, *mpImuCalib);
+
+    if(dbg){
+        std::cout << "[Debug] MonoRig: Nleft=" << mCurrentFrame.Nleft
+                  << " Nright=" << mCurrentFrame.Nright
+                  << " N=" << mCurrentFrame.N
+                  << " descriptors=" << mCurrentFrame.mDescriptors.rows
+                  << " (pooled: cam0+cam1 in ONE frame)" << std::endl;
+        int nStereo = 0;
+        for(size_t i=0;i<mCurrentFrame.mvLeftToRightMatch.size();++i)
+            if(mCurrentFrame.mvLeftToRightMatch[i] >= 0) nStereo++;
+        std::cout << "[Debug] MonoRig: cross-camera matches=" << nStereo
+                  << " (expect 0 on a non-overlapping rig)" << std::endl;
+        dbg = false;
+    }
+
+    // ---- spherical lines, both lenses into one container ------------------
+    if(mbUseLines && mpLineExtractor){
+        std::vector<LineObs> l0 = mpLineExtractor->Extract(mImGray, mpCamera, 0);
+        std::vector<LineObs> l1 = mpLineExtractor->Extract(imGrayRight, mpCamera2, 1);
+        mCurrentFrame.mvLines = l0;
+        mCurrentFrame.mvLines.insert(mCurrentFrame.mvLines.end(), l1.begin(), l1.end());
+        mCurrentFrame.mvpMapLines.assign(mCurrentFrame.mvLines.size(), nullptr);
+        mCurrentFrame.mvbLineOutlier.assign(mCurrentFrame.mvLines.size(), false);
+
+        mvLineAssign = mpLineExtractor->Match(mCurrentFrame.mvLines, mvPrevLines);
+        const std::vector<int> &a = mvLineAssign;
+        long m = 0;
+        for(size_t i = 0; i < a.size(); ++i) if(a[i] >= 0) ++m;
+        mnLineMatches += m; mnLineTotal += (long)mCurrentFrame.mvLines.size();
+        static long nf = 0;
+        if(++nf % 200 == 0)
+            std::cout << "[Debug] Lines: frame " << nf << "  detected "
+                      << mCurrentFrame.mvLines.size() << " (cam0 " << l0.size()
+                      << " cam1 " << l1.size() << ")  matched " << m
+                      << "  MapLines " << mnLineTriangulated
+                      << " (reobs " << mnLineObs << ", rejected " << mnLineRej << ")"
+                      << std::endl;
+        // ---- create / carry MapLines -------------------------------------
+        // Triangulate a tracked line from the two poses that observed it. The
+        // conventions that matter here:
+        //   * mvLines[].b1u/.b2u are UNIT bearings in the OBSERVING camera's
+        //     frame, so the pose used must be that camera's, not the body's.
+        //   * Tcw is world->camera; MapLine stores (d,m) in the WORLD frame.
+        //   * lo.cam picks the rig camera, so a rear-lens line is triangulated
+        //     through camera 1's pose, never camera 0's.
+        // Triangulate() refuses near-parallel interpretation planes, which is
+        // the usual case between adjacent frames -- so most lines only become
+        // MapLines once the rig has actually moved.
+        // (triangulation happens AFTER Track(): the pose does not exist yet)
+    }
+
+    if (mState==NO_IMAGES_YET) t0=timestamp;
+    mCurrentFrame.mNameFile = filename;
+    mCurrentFrame.mnDataset = mnNumDataset;
+    lastID = mCurrentFrame.mnId;
+    Track();
+
+    // ---- lines: triangulate now that Track() has produced a pose -----------
+    if(mbUseLines && !mCurrentFrame.mvLines.empty())
+    {
+        if(mCurrentFrame.HasPose())
+        {
+            const Sophus::SE3f Tcw_cur = mCurrentFrame.GetPose();
+            const Sophus::SE3f T_c1 = mpSystem->mRig.IsEnabled()
+                                    ? mpSystem->mRig.T_c1_c0() : Sophus::SE3f();
+            long nNew = 0, nObs = 0, nRej = 0;
+            const std::vector<int> &a = mvLineAssign;
+            for(size_t i = 0; i < a.size(); ++i)
+            {
+                LineObs &cur = mCurrentFrame.mvLines[i];
+                // pose of the LENS that made this observation
+                Sophus::SE3f Tc = Tcw_cur;
+                if(cur.cam == 1) Tc = T_c1 * Tc;
+
+                if(a[i] < 0 || a[i] >= (int)mvPrevLines.size()){
+                    // new track: anchor it here
+                    cur.hasAnchor = true; cur.nAnchor = cur.n;
+                    cur.RAnchor = Tc.rotationMatrix(); cur.tAnchor = Tc.translation();
+                    continue;
+                }
+                const LineObs &prv = mvPrevLines[a[i]];
+                if(cur.cam != prv.cam) continue;           // never mix lenses
+                if(!prv.hasAnchor){
+                    cur.hasAnchor = true; cur.nAnchor = cur.n;
+                    cur.RAnchor = Tc.rotationMatrix(); cur.tAnchor = Tc.translation();
+                    continue;
+                }
+                // carry the anchor AND the landmark forward
+                cur.hasAnchor = true; cur.nAnchor = prv.nAnchor;
+                cur.RAnchor = prv.RAnchor; cur.tAnchor = prv.tAnchor;
+                cur.pML = prv.pML;
+
+                if(cur.pML){
+                    // Already a landmark: this is another OBSERVATION of it, not
+                    // a new line. Minting a fresh MapLine per frame is what
+                    // produced 357k landmarks for ~1400 tracked lines.
+                    if(!cur.pML->isBad()){
+                        mCurrentFrame.mvpMapLines[i] = cur.pML;
+                        cur.pML->mnVisible++;
+                        nObs++;
+                    } else {
+                        cur.pML = nullptr;
+                    }
+                    continue;
+                }
+
+                Eigen::Vector3f dw, mw;
+                if(!MapLine::Triangulate(cur.n, Tc.rotationMatrix(), Tc.translation(),
+                                         cur.nAnchor, cur.RAnchor, cur.tAnchor,
+                                         2.0f, dw, mw))
+                    continue;      // still too little angle -- keep accumulating
+
+                // Sanity before admitting it to the map: the new landmark must
+                // actually explain the observation that created it. A line that
+                // triangulates to something it does not project back onto is a
+                // bad intersection, not a landmark.
+                MapLine* pML = new MapLine(dw, mw, mpReferenceKF, mpAtlas->GetCurrentMap());
+                const float e1 = pML->AngularError(Tc.rotationMatrix(), Tc.translation(), cur.b1u);
+                const float e2 = pML->AngularError(Tc.rotationMatrix(), Tc.translation(), cur.b2u);
+                if(std::max(e1, e2) > 0.02f){      // ~1.1 deg
+                    delete pML;
+                    nRej++;
+                    continue;
+                }
+                cur.pML = pML;
+                mCurrentFrame.mvpMapLines[i] = pML;
+                nNew++;
+            }
+            mnLineTriangulated += nNew;
+            mnLineObs += nObs; mnLineRej += nRej;
+        }
+
+        mvPrevLines = mCurrentFrame.mvLines;
+    }
+
+    return mCurrentFrame.GetPose();
+}
 
 Sophus::SE3f Tracking::GrabImageMonocular(const cv::Mat &im, const double &timestamp, string filename)
 {
@@ -2966,6 +3246,12 @@ bool Tracking::TrackLocalMap()
                 aux2++;
         }
 
+    // Snapshot the IMU-propagated pose BEFORE the visual optimisation touches
+    // it. Refusing the visual update at the bottom of this function is not
+    // enough on its own: PoseInertialOptimization* writes straight into
+    // mCurrentFrame, so without this the corrupted pose survives the refusal.
+    const Sophus::SE3f Tcw_imu_pred = mCurrentFrame.GetPose();
+
     int inliers;
     if (!mpAtlas->isImuInitialized())
         Optimizer::PoseOptimization(&mCurrentFrame);
@@ -3030,8 +3316,25 @@ bool Tracking::TrackLocalMap()
     if(mCurrentFrame.mnId<mnLastRelocFrameId+mMaxFrames && mnMatchesInliers<50)
         return false;
 
-    if((mnMatchesInliers>10)&&(mState==RECENTLY_LOST))
+    // RECENTLY_LOST means the IMU is already propagating the pose. Accepting a
+    // visual update on 11 inliers lets a handful of matches from a dark or
+    // blurred frame override that -- which is how run_2 ends up confidently 37 m
+    // wrong after the blackout at t=10157. Raising this bar makes the IMU carry
+    // the gap instead, which is what it is there for.
+    if((mnMatchesInliers > mnRecentlyLostMinInliers) && (mState==RECENTLY_LOST))
         return true;
+    if(mState==RECENTLY_LOST && mnMatchesInliers <= mnRecentlyLostMinInliers){
+        mCurrentFrame.SetPose(Tcw_imu_pred);          // hand the frame back to the IMU
+        for(int i=0; i<mCurrentFrame.N; i++)          // and drop the associations that
+            if(mCurrentFrame.mvpMapPoints[i])         // pulled it off course, so they are
+                mCurrentFrame.mvbOutlier[i] = true;   // not promoted into a keyframe
+        static long nRej = 0;
+        if(++nRej % 20 == 1)
+            std::cout << "[Debug] RECENTLY_LOST: rejecting visual update on "
+                      << mnMatchesInliers << " inliers (need > "
+                      << mnRecentlyLostMinInliers << "); IMU carries" << std::endl;
+        return false;
+    }
 
 
     if (mSensor == System::IMU_MONOCULAR)
