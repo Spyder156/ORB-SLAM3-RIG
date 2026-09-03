@@ -18,11 +18,25 @@
 
 
 #include "Map.h"
+#include "MapLine.h"
 
 #include<mutex>
 
 namespace ORB_SLAM3
 {
+
+void Map::AddMapLine(MapLine* pML)
+{
+    unique_lock<mutex> lock(mMutexMapLines);
+    mvpMapLines.push_back(pML);
+}
+
+std::vector<MapLine*> Map::GetAllMapLines()
+{
+    unique_lock<mutex> lock(mMutexMapLines);
+    return mvpMapLines;
+}
+
 
 long unsigned int Map::nNextId=0;
 
@@ -223,6 +237,11 @@ void Map::clear()
 //        delete *sit;
     }
 
+    {   // the lines belong to this map; a reset destroys them with it, else
+        // the dump keeps reporting landmarks from maps that no longer exist
+        unique_lock<mutex> lockl(mMutexMapLines);
+        mvpMapLines.clear();
+    }
     mspMapPoints.clear();
     mspKeyFrames.clear();
     mnMaxKFid = mnInitKFid;
@@ -278,6 +297,18 @@ void Map::ApplyScaledRotation(const Sophus::SE3f &T, const float s, const bool b
         MapPoint* pMP = *sit;
         pMP->SetWorldPos(s * Ryw * pMP->GetWorldPos() + tyw);
         pMP->UpdateNormalAndDepth();
+    }
+    {   // THE LINES MUST RIDE THE SAME TRANSFORM AS THE POINTS. This loop was
+        // missing: VIBA rescaled and rotated every keyframe and every MapPoint
+        // while every MapLine stayed in the pre-VIBA world frame -- after the
+        // first inertial BA, lines and points disagreed about what "world"
+        // means, permanently. Measured as line chi2 GROWING with apparent
+        // parallax (28-48 at >10deg): the "parallax" was the frame moving,
+        // not the camera.
+        unique_lock<mutex> lockl(mMutexMapLines);
+        for(MapLine* pML : mvpMapLines)
+            if(pML && !pML->isBad())
+                pML->ApplyScaledRotation(Ryw, s, tyw);
     }
     mnMapChange++;
 }

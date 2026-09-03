@@ -18,6 +18,7 @@
 
 
 #include "LocalMapping.h"
+#include "Rig.h"
 #include "LoopClosing.h"
 #include "ORBmatcher.h"
 #include "Optimizer.h"
@@ -63,6 +64,9 @@ void LocalMapping::SetTracker(Tracking *pTracker)
 
 void LocalMapping::Run()
 {
+    Rig::Stage("localmapping", "thread start; rig consumers: triangulation across "
+                               "cameras, rig-constrained local BA, VI-BA");
+
     mbFinished = false;
 
     while(1)
@@ -228,13 +232,13 @@ void LocalMapping::Run()
                         }
 
                         // scale refinement
-                        if (((mpAtlas->KeyFramesInMap())<=200) &&
-                                ((mTinit>25.0f && mTinit<25.5f)||
-                                (mTinit>35.0f && mTinit<35.5f)||
-                                (mTinit>45.0f && mTinit<45.5f)||
-                                (mTinit>55.0f && mTinit<55.5f)||
-                                (mTinit>65.0f && mTinit<65.5f)||
-                                (mTinit>75.0f && mTinit<75.5f))){
+                        // FIX: upstream gates this on <=200 keyframes and on
+                        // hardcoded windows ending at 75 s. Our sequences have
+                        // ~560 KFs over ~130 s, so scale refinement NEVER ran and
+                        // scale stayed frozen at its init value (~2.2% error).
+                        // Now: no KF cap, and a periodic window every 10 s.
+                        if (fmodf(mTinit, 10.0f) > 5.0f && fmodf(mTinit, 10.0f) < 5.5f
+                            && mTinit > 25.0f){
                             if (mbMonocular)
                                 ScaleRefinement();
                         }

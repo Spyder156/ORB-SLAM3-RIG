@@ -26,6 +26,7 @@
 #include <set>
 #include <pangolin/pangolin.h>
 #include <mutex>
+#include <atomic>
 
 #include <boost/serialization/base_object.hpp>
 
@@ -34,6 +35,7 @@ namespace ORB_SLAM3
 {
 
 class MapPoint;
+class MapLine;
 class KeyFrame;
 class Atlas;
 class KeyFrameDatabase;
@@ -69,6 +71,19 @@ class Map
 
 public:
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+    /// MapLines were never registered anywhere: reachable only from the frame
+    /// that created them, so nothing could enumerate, cull or free them and
+    /// ~790k leaked over a single run. Registering them here is the
+    /// prerequisite for dumping them and, later, for culling them.
+    void AddMapLine(MapLine* pML);
+    std::vector<MapLine*> GetAllMapLines();
+
+    /// Bumped ONLY when the whole world frame is re-expressed
+    /// (ApplyScaledRotation: VIBA scale/gravity, loop-closure scale). Local BA
+    /// moves poses by millimetres and must NOT invalidate line anchors, which
+    /// need tens of frames to accumulate parallax.
+    int GetWorldFrameVersion(){ return mnWorldFrameVersion.load(); }
+
     Map();
     Map(int initKFid);
     ~Map();
@@ -156,6 +171,9 @@ public:
     std::set<long unsigned int> msFixedKFs;
 
 protected:
+    std::vector<MapLine*> mvpMapLines;
+    std::mutex mMutexMapLines;
+    std::atomic<int> mnWorldFrameVersion{0};
 
     long unsigned int mnId;
 

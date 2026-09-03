@@ -135,6 +135,9 @@ public:
     MapPoint* GetReplaced();
 
     void IncreaseVisible(int n=1);
+    /// Give back a visibility tick charged on a frame the camera could not see
+    /// in. Never drops mnVisible below mnFound, which would invert the ratio.
+    void DecreaseVisible(int n=1);
     void IncreaseFound(int n=1);
     float GetFoundRatio();
     inline int GetFound(){

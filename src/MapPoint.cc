@@ -314,6 +314,12 @@ void MapPoint::IncreaseVisible(int n)
     mnVisible+=n;
 }
 
+void MapPoint::DecreaseVisible(int n)
+{
+    unique_lock<mutex> lock(mMutexFeatures);
+    mnVisible = max(mnFound, mnVisible - n);
+}
+
 void MapPoint::IncreaseFound(int n)
 {
     unique_lock<mutex> lock(mMutexFeatures);
