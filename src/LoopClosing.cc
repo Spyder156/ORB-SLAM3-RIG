@@ -18,6 +18,7 @@
 
 
 #include "LoopClosing.h"
+#include "Rig.h"
 
 #include "Sim3Solver.h"
 #include "Converter.h"
@@ -89,6 +90,9 @@ void LoopClosing::SetLocalMapper(LocalMapping *pLocalMapper)
 
 void LoopClosing::Run()
 {
+    Rig::Stage("loopclosing", "thread start; rig consumers: cross-camera place "
+                              "recognition, rig-consistent geometric verification");
+
     mbFinished =false;
 
     while(1)

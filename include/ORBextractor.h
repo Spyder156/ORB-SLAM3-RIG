@@ -49,6 +49,12 @@ public:
     ORBextractor(int nfeatures, float scaleFactor, int nlevels,
                  int iniThFAST, int minThFAST);
 
+    // Validity mask, full sensor resolution. Convention: NONZERO == MASKED
+    // (ignore), matching OpenVINS and OKVIS2's actual behaviour. Needed for
+    // fisheye lenses, whose image corners lie outside the image circle.
+    void SetMask(const cv::Mat& mask);
+    bool HasMask() const { return !mMask.empty(); }
+
     ~ORBextractor(){}
 
     // Compute the ORB features and descriptors on an image.
@@ -81,6 +87,7 @@ public:
     }
 
     std::vector<cv::Mat> mvImagePyramid;
+    cv::Mat mMask;
 
 protected:
 

@@ -778,6 +778,19 @@ namespace ORB_SLAM3
         return vResultKeys;
     }
 
+    void ORBextractor::SetMask(const cv::Mat& mask)
+    {
+        // Convention: NONZERO == MASKED (ignore). Same as OpenVINS, and the same
+        // as OKVIS2's actual isMasked() behaviour (whose doc comment is wrong).
+        if (mask.empty()) { mMask = cv::Mat(); return; }
+        CV_Assert(mask.type() == CV_8UC1);
+        mMask = mask;
+        std::cout << "[ORBextractor] mask set: "
+                  << cv::countNonZero(mMask) << "/" << mMask.total()
+                  << " px MASKED (" << 100.0*cv::countNonZero(mMask)/mMask.total()
+                  << "%)" << std::endl;
+    }
+
     void ORBextractor::ComputeKeyPointsOctTree(vector<vector<KeyPoint> >& allKeypoints)
     {
         allKeypoints.resize(nlevels);
@@ -869,6 +882,29 @@ namespace ORB_SLAM3
                     }
 
                 }
+            }
+
+            // Drop masked corners BEFORE DistributeOctTree, which is the
+            // retention/truncation step. Filtering afterwards would let the
+            // octree allocate its quota to keypoints that then get deleted,
+            // silently starving the feature count.
+            if(!mMask.empty())
+            {
+                const float invScale = mvScaleFactor[level];
+                vector<KeyPoint> vKept;
+                vKept.reserve(vToDistributeKeys.size());
+                for(size_t ik=0; ik<vToDistributeKeys.size(); ik++)
+                {
+                    // level coords (relative to minBorder) -> original image coords
+                    const int ux = cvRound((vToDistributeKeys[ik].pt.x + minBorderX) * invScale);
+                    const int uy = cvRound((vToDistributeKeys[ik].pt.y + minBorderY) * invScale);
+                    if(ux < 0 || uy < 0 || ux >= mMask.cols || uy >= mMask.rows)
+                        continue;
+                    if(mMask.at<uchar>(uy, ux))   // nonzero == masked
+                        continue;
+                    vKept.push_back(vToDistributeKeys[ik]);
+                }
+                vToDistributeKeys.swap(vKept);
             }
 
             vector<KeyPoint> & keypoints = allKeypoints[level];

@@ -17,6 +17,7 @@
 */
 
 #include "Frame.h"
+#include "Rig.h"
 
 #include "G2oTypes.h"
 #include "MapPoint.h"
@@ -1124,6 +1125,24 @@ Frame::Frame(const cv::Mat &imLeft, const cv::Mat &imRight, const double &timeSt
 }
 
 void Frame::ComputeStereoFishEyeMatches() {
+    // MONO-RIG: on a non-overlapping (back-to-back) rig the two cameras share no
+    // field of view at any instant, so every "stereo" match is false. Skip the
+    // matching and leave the correspondence/depth arrays empty; every downstream
+    // site already guards on mvLeftToRightMatch[i] != -1, so both cameras then
+    // contribute purely MONOCULAR observations -- which is correct for this rig.
+    // Depth comes from triangulating across TIME, not across lenses.
+    if (Rig::NonOverlappingGlobal()) {
+        Rig::StageOnce("frame", "non-overlapping rig: cross-camera stereo "
+                                "matching SKIPPED; both cameras are monocular");
+        mvLeftToRightMatch = std::vector<int>(Nleft, -1);
+        mvRightToLeftMatch = std::vector<int>(Nright, -1);
+        mvDepth = std::vector<float>(Nleft, -1.0f);
+        mvuRight = std::vector<float>(Nleft, -1);
+        mvStereo3Dpoints = std::vector<Eigen::Vector3f>(Nleft);
+        mnCloseMPs = 0;
+        return;
+    }
+
     //Speed it up by matching keypoints in the lapping area
     vector<cv::KeyPoint> stereoLeft(mvKeys.begin() + monoLeft, mvKeys.end());
     vector<cv::KeyPoint> stereoRight(mvKeysRight.begin() + monoRight, mvKeysRight.end());
