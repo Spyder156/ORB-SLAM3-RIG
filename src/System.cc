@@ -19,6 +19,7 @@
 
 
 #include "System.h"
+#include "MapLine.h"
 #include "Converter.h"
 #include <thread>
 #include <pangolin/pangolin.h>
@@ -188,6 +189,12 @@ System::System(const string &strVocFile, const string &strSettingsFile, const eS
     //Initialize the Tracking thread
     //(it will live in the main thread of execution, the one that called this constructor)
     cout << "Seq. Name: " << strSequence << endl;
+    // ---- rig: load BEFORE the threads start, so every consumer sees the same
+    // extrinsics and the log shows the rig state before any tracking output.
+    mRig.LoadFromSettings(strSettingsFile);
+    if(mRig.IsEnabled())
+        Rig::Stage("system", "rig available to Tracking / LocalMapping / LoopClosing");
+
     mpTracker = new Tracking(this, mpVocabulary, mpFrameDrawer, mpMapDrawer,
                              mpAtlas, mpKeyFrameDatabase, strSettingsFile, mSensor, settings_, strSequence);
 
@@ -388,6 +395,68 @@ Sophus::SE3f System::TrackRGBD(const cv::Mat &im, const cv::Mat &depthmap, const
             mpTracker->GrabImuData(vImuMeas[i_imu]);
 
     Sophus::SE3f Tcw = mpTracker->GrabImageRGBD(imToFeed,imDepthToFeed,timestamp,filename);
+
+    unique_lock<mutex> lock2(mMutexState);
+    mTrackingState = mpTracker->mState;
+    mTrackedMapPoints = mpTracker->mCurrentFrame.mvpMapPoints;
+    mTrackedKeyPointsUn = mpTracker->mCurrentFrame.mvKeysUn;
+    return Tcw;
+}
+
+Sophus::SE3f System::TrackMonoRig(const cv::Mat &im0, const cv::Mat &im1, const double &timestamp,
+                                  const vector<IMU::Point>& vImuMeas, string filename)
+{
+    {
+        unique_lock<mutex> lock(mMutexReset);
+        if(mbShutDown) return Sophus::SE3f();
+    }
+    if(mSensor!=MONOCULAR && mSensor!=IMU_MONOCULAR)
+    {
+        cerr << "[Debug] TrackMonoRig FATAL: sensor is not Monocular/Monocular-Inertial. "
+                "Experiment B runs the RIG on the MONO path on purpose -- see "
+                "SLAM/patches/orbslam3_rigB/README.md" << endl;
+        exit(-1);
+    }
+    if(!mRig.IsEnabled())
+    {
+        cerr << "[Debug] TrackMonoRig FATAL: Rig.enabled is 0 but a 2-camera "
+                "frame was fed" << endl;
+        exit(-1);
+    }
+
+    cv::Mat i0 = im0.clone(), i1 = im1.clone();
+    if(settings_ && settings_->needToResize()){
+        cv::resize(i0,i0,settings_->newImSize());
+        cv::resize(i1,i1,settings_->newImSize());
+    }
+
+    // mode / reset handling, identical to TrackMonocular
+    {
+        unique_lock<mutex> lock(mMutexMode);
+        if(mbActivateLocalizationMode)
+        {
+            mpLocalMapper->RequestStop();
+            while(!mpLocalMapper->isStopped()) usleep(1000);
+            mpTracker->InformOnlyTracking(true);
+            mbActivateLocalizationMode = false;
+        }
+        if(mbDeactivateLocalizationMode)
+        {
+            mpTracker->InformOnlyTracking(false);
+            mpLocalMapper->Release();
+            mbDeactivateLocalizationMode = false;
+        }
+    }
+    {
+        unique_lock<mutex> lock(mMutexReset);
+        if(mbReset){ mpTracker->Reset(); mbReset=false; mbResetActiveMap=false; }
+        else if(mbResetActiveMap){ mpTracker->ResetActiveMap(); mbResetActiveMap=false; }
+    }
+
+    if (mSensor == System::IMU_MONOCULAR)
+        for(size_t i=0;i<vImuMeas.size();i++) mpTracker->GrabImuData(vImuMeas[i]);
+
+    Sophus::SE3f Tcw = mpTracker->GrabImageMonoRig(i0,i1,timestamp,filename);
 
     unique_lock<mutex> lock2(mMutexState);
     mTrackingState = mpTracker->mState;
@@ -659,6 +728,166 @@ void System::SaveKeyFrameTrajectoryTUM(const string &filename)
     f.close();
 }
 
+void System::OpenKeypointDump(const string &filename)
+{
+    mKpDump.open(filename);
+    if(!mKpDump.is_open()){
+        cerr << "[Debug] OpenKeypointDump FATAL: cannot write " << filename << endl;
+        exit(-1);
+    }
+    mKpDump << "t,cam,id,u,v,tracked" << endl;
+    cout << "[Debug] keypoint dump -> " << filename << endl;
+}
+
+void System::DumpFrameKeypoints()
+{
+    if(!mKpDump.is_open()) return;
+    Frame &F = mpTracker->mCurrentFrame;
+    const int nL = (F.Nleft == -1) ? (int)F.mvKeys.size() : F.Nleft;
+    for(int i = 0; i < F.N; i++)
+    {
+        // camera index is IMPLICIT in ORB-SLAM3: idx < Nleft is the front
+        // camera, the rest belong to the rear one.
+        const int cam = (F.Nleft == -1 || i < nL) ? 0 : 1;
+        const cv::KeyPoint &kp = (F.Nleft == -1) ? F.mvKeysUn[i]
+                                : (i < nL ? F.mvKeys[i] : F.mvKeysRight[i - nL]);
+        long id = -1; int tracked = 0;
+        if(i < (int)F.mvpMapPoints.size() && F.mvpMapPoints[i]){
+            id = (long)F.mvpMapPoints[i]->mnId;
+            tracked = (i < (int)F.mvbOutlier.size() && F.mvbOutlier[i]) ? 0 : 1;
+        }
+        mKpDump << std::fixed << std::setprecision(9) << F.mTimeStamp << ","
+                << cam << "," << id << ","
+                << std::setprecision(2) << kp.pt.x << "," << kp.pt.y << ","
+                << tracked << "\n";
+    }
+}
+
+void System::CloseKeypointDump()
+{
+    if(mKpDump.is_open()){ mKpDump.flush(); mKpDump.close(); }
+}
+
+void System::SaveMapPoints(const string &filename)
+{
+    cout << endl << "Saving map points to " << filename << " ..." << endl;
+    vector<Map*> vpMaps = mpAtlas->GetAllMaps();
+    // largest map = the one that actually tracked
+    Map* pBiggerMap = nullptr;
+    size_t numMax = 0;
+    for(Map* pMap : vpMaps)
+        if(pMap->GetAllKeyFrames().size() > numMax){ numMax = pMap->GetAllKeyFrames().size(); pBiggerMap = pMap; }
+    if(!pBiggerMap){ cout << "  no map to save" << endl; return; }
+
+    // SAME REFERENCE FRAME AS SaveTrajectoryEuRoC.
+    // That function re-expresses the trajectory relative to the FIRST keyframe
+    // ("b0 is the new world reference"), because after a loop closure the first
+    // keyframe is no longer at the origin. Dumping landmarks in the raw world
+    // frame instead left the map and the trajectory in two different frames --
+    // the map looked plausible on its own and the camera never passed through
+    // it. Anything written next to that trajectory must use the same frame.
+    vector<KeyFrame*> vpKFsOrd = pBiggerMap->GetAllKeyFrames();
+    sort(vpKFsOrd.begin(), vpKFsOrd.end(), KeyFrame::lId);
+    Sophus::SE3f Twb0;
+    if(!vpKFsOrd.empty())
+        Twb0 = (mSensor==IMU_MONOCULAR || mSensor==IMU_STEREO || mSensor==IMU_RGBD)
+                 ? vpKFsOrd[0]->GetImuPose() : vpKFsOrd[0]->GetPoseInverse();
+    const Sophus::SE3f Tb0w = Twb0.inverse();
+
+    ofstream f(filename);
+    // cam column: which camera the landmark was seen by. On the rig this is the
+    // direct test of whether the geometry is right -- cam0 points should sit
+    // AHEAD of the camera and cam1 points BEHIND it.
+    //   0 = front only, 1 = rear only, 2 = both cameras observed it
+    f << fixed << "t,x,y,z,cam" << endl;
+    int n = 0, nbad = 0, n0 = 0, n1 = 0, nboth = 0;
+    for(MapPoint* pMP : pBiggerMap->GetAllMapPoints())
+    {
+        if(!pMP || pMP->isBad()){ nbad++; continue; }
+        Eigen::Vector3f P = Tb0w * pMP->GetWorldPos();   // world -> b0
+        double t = 0.0;
+        KeyFrame* pRef = pMP->GetReferenceKeyFrame();
+        if(pRef) t = pRef->mTimeStamp;          // first-seen time -> growing cloud
+
+        bool seen0 = false, seen1 = false;
+        for(auto &ob : pMP->GetObservations())
+        {
+            KeyFrame* pKF = ob.first;
+            if(!pKF) continue;
+            const int li = get<0>(ob.second);
+            const int ri = get<1>(ob.second);
+            if(li >= 0) seen0 = true;   // left/front observation
+            if(ri >= 0) seen1 = true;   // right/rear observation
+        }
+        int cam = seen0 && seen1 ? 2 : (seen1 ? 1 : 0);
+        if(cam==0) n0++; else if(cam==1) n1++; else nboth++;
+
+        f << setprecision(9) << t << ","
+          << setprecision(6) << P(0) << "," << P(1) << "," << P(2) << ","
+          << cam << endl;
+        n++;
+    }
+    cout << "  by camera: front-only " << n0 << ", rear-only " << n1
+         << ", both " << nboth << endl;
+    f.close();
+    cout << "  wrote " << n << " map points (" << nbad << " bad/culled skipped)" << endl;
+}
+
+void System::SaveMapLines(const string &filename)
+{
+    cout << endl << "Saving map lines to " << filename << " ..." << endl;
+    vector<Map*> vpMaps = mpAtlas->GetAllMaps();
+    Map* pBiggerMap = nullptr;
+    size_t numMax = 0;
+    for(Map* pMap : vpMaps)
+        if(pMap->GetAllKeyFrames().size() > numMax){
+            numMax = pMap->GetAllKeyFrames().size(); pBiggerMap = pMap; }
+    if(!pBiggerMap){ cout << "  no map to save" << endl; return; }
+
+    // SAME FRAME AS THE POINTS AND THE TRAJECTORY (see SaveMapPoints).
+    vector<KeyFrame*> vpKFsOrd = pBiggerMap->GetAllKeyFrames();
+    sort(vpKFsOrd.begin(), vpKFsOrd.end(), KeyFrame::lId);
+    Sophus::SE3f Twb0;
+    if(!vpKFsOrd.empty())
+        Twb0 = (mSensor==IMU_MONOCULAR || mSensor==IMU_STEREO || mSensor==IMU_RGBD)
+                 ? vpKFsOrd[0]->GetImuPose() : vpKFsOrd[0]->GetPoseInverse();
+    const Sophus::SE3f Tb0w = Twb0.inverse();
+
+    ofstream f(filename);
+    f << fixed << "t,x1,y1,z1,x2,y2,z2" << endl;
+    long n = 0, noext = 0;
+    for(MapLine* pML : pBiggerMap->GetAllMapLines())
+    {
+        if(!pML || pML->isBad()) continue;
+        // Use the segment the camera ACTUALLY SAW, recovered by intersecting
+        // the observation's endpoint bearings with the line. The previous
+        // version drew a fixed-length stub at the line's point of closest
+        // approach to the camera -- which is the perpendicular foot, so every
+        // line landed at roughly constant radius around the trajectory and the
+        // map rendered as a spherical shell of 10 cm dashes (51% of segments
+        // were pinned at the 0.10 m floor). A Plucker line is infinite; the
+        // only honest finite piece is the observed one.
+        // Only landmarks that actually CONTRIBUTED to tracking: probation
+        // (mnValidated >= 2) is the bar for entering the pose optimizers, so
+        // everything below it never voted and does not belong in the map.
+        if(pML->mnValidated < 2){ noext++; continue; }
+        if(!pML->mbHasExtent){ noext++; continue; }
+        Eigen::Vector3f e1 = pML->mEnd1, e2 = pML->mEnd2;
+        if(!e1.allFinite() || !e2.allFinite()) continue;
+        if((e2 - e1).norm() < 1e-3f) continue;
+        e1 = Tb0w * e1;  e2 = Tb0w * e2;
+        double t = 0.0;
+        if(KeyFrame* pRef = pML->GetReferenceKeyFrame()) t = pRef->mTimeStamp;
+        f << setprecision(9) << t << "," << setprecision(6)
+          << e1(0) << "," << e1(1) << "," << e1(2) << ","
+          << e2(0) << "," << e2(1) << "," << e2(2) << endl;
+        n++;
+    }
+    f.close();
+    if(noext) cout << "  skipped " << noext << " lines with no observed extent" << endl;
+    cout << "  wrote " << n << " map lines" << endl;
+}
+
 void System::SaveTrajectoryEuRoC(const string &filename)
 {
 
@@ -671,7 +900,10 @@ void System::SaveTrajectoryEuRoC(const string &filename)
 
     vector<Map*> vpMaps = mpAtlas->GetAllMaps();
     int numMaxKFs = 0;
-    Map* pBiggerMap;
+    // Uninitialised upstream: when no map has any keyframes the loop below
+    // never assigns it, and the dereference that follows is undefined -- a
+    // segfault at shutdown whenever a run ends just after a map reset.
+    Map* pBiggerMap = nullptr;
     std::cout << "There are " << std::to_string(vpMaps.size()) << " maps in the atlas" << std::endl;
     for(Map* pMap :vpMaps)
     {
@@ -683,8 +915,18 @@ void System::SaveTrajectoryEuRoC(const string &filename)
         }
     }
 
+    if(!pBiggerMap)
+    {
+        cout << "  no map has any keyframes -- nothing to save" << endl;
+        return;
+    }
     vector<KeyFrame*> vpKFs = pBiggerMap->GetAllKeyFrames();
     sort(vpKFs.begin(),vpKFs.end(),KeyFrame::lId);
+    if(vpKFs.empty())
+    {
+        cout << "  map has no keyframes -- nothing to save" << endl;
+        return;
+    }
 
     // Transform all keyframes so that the first keyframe is at the origin.
     // After a loop closure the first keyframe might not be at the origin.
@@ -892,7 +1134,10 @@ void System::SaveTrajectoryEuRoC(const string &filename, Map* pMap)
     }
 
     vector<Map*> vpMaps = mpAtlas->GetAllMaps();
-    Map* pBiggerMap;
+    // Uninitialised upstream: when no map has any keyframes the loop below
+    // never assigns it, and the dereference that follows is undefined -- a
+    // segfault at shutdown whenever a run ends just after a map reset.
+    Map* pBiggerMap = nullptr;
     int numMaxKFs = 0;
     for(Map* pMap :vpMaps)
     {
@@ -903,8 +1148,18 @@ void System::SaveTrajectoryEuRoC(const string &filename, Map* pMap)
         }
     }
 
+    if(!pBiggerMap)
+    {
+        cout << "  no map has any keyframes -- nothing to save" << endl;
+        return;
+    }
     vector<KeyFrame*> vpKFs = pBiggerMap->GetAllKeyFrames();
     sort(vpKFs.begin(),vpKFs.end(),KeyFrame::lId);
+    if(vpKFs.empty())
+    {
+        cout << "  map has no keyframes -- nothing to save" << endl;
+        return;
+    }
 
     // Transform all keyframes so that the first keyframe is at the origin.
     // After a loop closure the first keyframe might not be at the origin.
@@ -1007,7 +1262,10 @@ void System::SaveTrajectoryEuRoC(const string &filename, Map* pMap)
     cout << endl << "Saving keyframe trajectory to " << filename << " ..." << endl;
 
     vector<Map*> vpMaps = mpAtlas->GetAllMaps();
-    Map* pBiggerMap;
+    // Uninitialised upstream: when no map has any keyframes the loop below
+    // never assigns it, and the dereference that follows is undefined -- a
+    // segfault at shutdown whenever a run ends just after a map reset.
+    Map* pBiggerMap = nullptr;
     int numMaxKFs = 0;
     for(Map* pMap :vpMaps)
     {
@@ -1018,8 +1276,18 @@ void System::SaveTrajectoryEuRoC(const string &filename, Map* pMap)
         }
     }
 
+    if(!pBiggerMap)
+    {
+        cout << "  no map has any keyframes -- nothing to save" << endl;
+        return;
+    }
     vector<KeyFrame*> vpKFs = pBiggerMap->GetAllKeyFrames();
     sort(vpKFs.begin(),vpKFs.end(),KeyFrame::lId);
+    if(vpKFs.empty())
+    {
+        cout << "  map has no keyframes -- nothing to save" << endl;
+        return;
+    }
 
     // Transform all keyframes so that the first keyframe is at the origin.
     // After a loop closure the first keyframe might not be at the origin.
@@ -1059,7 +1327,10 @@ void System::SaveKeyFrameTrajectoryEuRoC(const string &filename)
     cout << endl << "Saving keyframe trajectory to " << filename << " ..." << endl;
 
     vector<Map*> vpMaps = mpAtlas->GetAllMaps();
-    Map* pBiggerMap;
+    // Uninitialised upstream: when no map has any keyframes the loop below
+    // never assigns it, and the dereference that follows is undefined -- a
+    // segfault at shutdown whenever a run ends just after a map reset.
+    Map* pBiggerMap = nullptr;
     int numMaxKFs = 0;
     for(Map* pMap :vpMaps)
     {
@@ -1076,8 +1347,18 @@ void System::SaveKeyFrameTrajectoryEuRoC(const string &filename)
         return;
     }
 
+    if(!pBiggerMap)
+    {
+        cout << "  no map has any keyframes -- nothing to save" << endl;
+        return;
+    }
     vector<KeyFrame*> vpKFs = pBiggerMap->GetAllKeyFrames();
     sort(vpKFs.begin(),vpKFs.end(),KeyFrame::lId);
+    if(vpKFs.empty())
+    {
+        cout << "  map has no keyframes -- nothing to save" << endl;
+        return;
+    }
 
     // Transform all keyframes so that the first keyframe is at the origin.
     // After a loop closure the first keyframe might not be at the origin.

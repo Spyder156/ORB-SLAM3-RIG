@@ -38,6 +38,9 @@
 #include "ORBVocabulary.h"
 #include "Viewer.h"
 #include "ImuTypes.h"
+#include <fstream>
+
+#include "Rig.h"
 #include "Settings.h"
 
 
@@ -83,6 +86,10 @@ class Settings;
 class System
 {
 public:
+    // Non-overlapping rig (Step 0 extrinsics). Owned here, shared by the threads.
+    Rig mRig;
+    std::ofstream mKpDump;
+
     // Input sensor
     enum eSensor{
         MONOCULAR=0,
@@ -120,6 +127,10 @@ public:
     // Returns the camera pose (empty if tracking fails).
     Sophus::SE3f TrackMonocular(const cv::Mat &im, const double &timestamp, const vector<IMU::Point>& vImuMeas = vector<IMU::Point>(), string filename="");
 
+    /// Experiment B: non-overlapping 2-camera rig on the MONOCULAR path.
+    Sophus::SE3f TrackMonoRig(const cv::Mat &im0, const cv::Mat &im1, const double &timestamp,
+                              const vector<IMU::Point>& vImuMeas = vector<IMU::Point>(), string filename="");
+
 
     // This stops local mapping thread (map building) and performs only camera tracking.
     void ActivateLocalizationMode();
@@ -153,6 +164,27 @@ public:
     void SaveKeyFrameTrajectoryTUM(const string &filename);
 
     void SaveTrajectoryEuRoC(const string &filename);
+
+    // Dump the sparse map. ORB-SLAM3 builds a MapPoint cloud but the stock
+    // examples never write it out, so every run looked cloudless. Each point
+    // carries the timestamp of its first observing keyframe, which lets a
+    // viewer GROW the cloud over time instead of popping it in at the end.
+    void SaveMapPoints(const string &filename);
+
+    /// Dump the map's LINES as world-frame segments, in the same reference
+    /// frame as SaveMapPoints and SaveTrajectoryEuRoC.
+    void SaveMapLines(const string &filename);
+
+    /// Per-frame keypoint dump for the run-output contract (SLAM/docs/OUTPUT.md).
+    /// Without this the rerun has no feature overlay and a front-end failure is
+    /// undiagnosable -- which is exactly the position we were in on the door
+    /// failure. Columns: t,cam,id,u,v,tracked
+    ///   cam     : 0 = front, 1 = rear (index >= Nleft on the mono-rig path)
+    ///   id      : MapPoint id, or -1 if the keypoint has no landmark yet
+    ///   tracked : 1 if it has a MapPoint and is not an outlier
+    void OpenKeypointDump(const string &filename);
+    void DumpFrameKeypoints();
+    void CloseKeypointDump();
     void SaveKeyFrameTrajectoryEuRoC(const string &filename);
 
     void SaveTrajectoryEuRoC(const string &filename, Map* pMap);
