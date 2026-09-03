@@ -145,7 +145,15 @@ namespace ORB_SLAM3 {
         cout << "\t-Loaded camera 1" << endl;
 
         //Read second camera if stereo (not rectified)
-        if(sensor_ == System::STEREO || sensor_ == System::IMU_STEREO){
+        // Experiment B also needs camera 2 on the MONOCULAR path: a
+        // non-overlapping rig is two mono cameras, not a stereo pair.
+        // See SLAM/patches/orbslam3_rigB/README.md
+        bool bRigOnMono = (!fSettings["Rig.enabled"].empty() &&
+                           (int)fSettings["Rig.enabled"] != 0);
+        if(sensor_ == System::STEREO || sensor_ == System::IMU_STEREO || bRigOnMono){
+            if(bRigOnMono && sensor_ != System::STEREO && sensor_ != System::IMU_STEREO)
+                cout << "[Debug] Settings: Rig.enabled=1 on a MONO sensor -> "
+                        "reading Camera2 anyway (Experiment B)" << endl;
             readCamera2(fSettings);
             cout << "\t-Loaded camera 2" << endl;
         }

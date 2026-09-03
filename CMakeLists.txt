@@ -42,6 +42,15 @@ find_package(Eigen3 3.1.0 REQUIRED)
 find_package(Pangolin REQUIRED)
 find_package(realsense2)
 
+# ELSED (spherical line features). Compiled in directly -- its own CMakeLists
+# also builds a pybind11 module needing python-dev, which we do not want here.
+if(NOT DEFINED ELSED_DIR)
+  set(ELSED_DIR ${PROJECT_SOURCE_DIR}/../ELSED)
+endif()
+file(GLOB ELSED_SRC ${ELSED_DIR}/src/*.cpp)
+list(FILTER ELSED_SRC EXCLUDE REGEX "PYAPI|main")
+include_directories(${ELSED_DIR}/src)
+
 include_directories(
 ${PROJECT_SOURCE_DIR}
 ${PROJECT_SOURCE_DIR}/include
@@ -55,6 +64,10 @@ set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR}/lib)
 
 add_library(${PROJECT_NAME} SHARED
 src/System.cc
+src/LineExtractor.cc
+src/MapLine.cc
+${ELSED_SRC}
+src/Rig.cc
 src/Tracking.cc
 src/LocalMapping.cc
 src/LoopClosing.cc
@@ -220,6 +233,10 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR}/Examples/Monocular-Iner
 
 add_executable(mono_inertial_euroc
         Examples/Monocular-Inertial/mono_inertial_euroc.cc)
+
+add_executable(mono_rig_euroc
+        Examples/Monocular-Inertial/mono_rig_euroc.cc)
+target_link_libraries(mono_rig_euroc ${PROJECT_NAME})
 target_link_libraries(mono_inertial_euroc ${PROJECT_NAME})
 
 add_executable(mono_inertial_tum_vi

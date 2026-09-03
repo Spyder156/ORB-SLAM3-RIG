@@ -36,6 +36,10 @@ void LoadImages(const string &strImagePath, const string &strPathTimes,
 
 void LoadIMU(const string &strImuPath, vector<double> &vTimeStamps, vector<cv::Point3f> &vAcc, vector<cv::Point3f> &vGyro);
 
+// MONO-RIG (Experiment B): two non-overlapping cameras fed to the MONOCULAR
+// pipeline. Both images become ONE Frame with pooled descriptors; the rig
+// carries only its scale-free rotation until the map is metric.
+// See SLAM/patches/orbslam3_rigB/README.md
 double ttrack_tot = 0;
 int main(int argc, char *argv[])
 {
@@ -83,6 +87,7 @@ int main(int argc, char *argv[])
         string pathTimeStamps(argv[(2*seq) + 4]);
 
         string pathCam0 = pathSeq + "/mav0/cam0/data";
+        string pathCam1 = pathSeq + "/mav0/cam1/data";   // MONO-RIG: rear lens
         string pathImu = pathSeq + "/mav0/imu0/data.csv";
 
         LoadImages(pathCam0, pathTimeStamps, vstrImageFilenames[seq], vTimestampsCam[seq]);
@@ -120,6 +125,16 @@ int main(int argc, char *argv[])
     // Viewer OFF: Pangolin needs an X display and we run headless in docker.
     // (QT_QPA_PLATFORM=offscreen does not help -- Pangolin is X11/GLX, not Qt.)
     ORB_SLAM3::System SLAM(argv[1],argv[2],ORB_SLAM3::System::IMU_MONOCULAR, false);
+    cout << "[Debug] mono_rig_euroc: sensor = IMU_MONOCULAR with a 2-camera rig" << endl;
+    // CLAHE: ORB-SLAM3 already does this for TUM-VI (mono_inertial_tum_vi.cc).
+    // Our failure is dark, low-contrast frames where BOTH lenses drop to 0
+    // tracked features for ~1 s. Enable with ORB_CLAHE=1 (clip limit via
+    // ORB_CLAHE_CLIP, default 3.0).
+    const bool useClahe = (getenv("ORB_CLAHE") && atoi(getenv("ORB_CLAHE")) != 0);
+    const double claheClip = getenv("ORB_CLAHE_CLIP") ? atof(getenv("ORB_CLAHE_CLIP")) : 3.0;
+    cv::Ptr<cv::CLAHE> clahe = cv::createCLAHE(claheClip, cv::Size(8, 8));
+    cout << "[Debug] CLAHE " << (useClahe ? "ON" : "off")
+         << " (clip " << claheClip << ")" << endl;
     SLAM.OpenKeypointDump("kp_" + string(argv[argc-1]) + ".csv");
     float imageScale = SLAM.GetImageScale();
 
@@ -138,6 +153,26 @@ int main(int argc, char *argv[])
         {
             // Read image from file
             im = cv::imread(vstrImageFilenames[seq][ni],cv::IMREAD_UNCHANGED); //CV_LOAD_IMAGE_UNCHANGED);
+            // MONO-RIG: the rear image is the same filename under cam1. The two
+            // folders were verified to carry identical timestamp sets, so a
+            // path swap is exact -- no nearest-time matching needed.
+            string sRight = vstrImageFilenames[seq][ni];
+            {
+                size_t p0 = sRight.find("/cam0/");
+                if(p0 == string::npos){
+                    cerr << "[Debug] mono_rig FATAL: image path has no /cam0/ : "
+                         << sRight << endl;
+                    return 1;
+                }
+                sRight.replace(p0, 6, "/cam1/");
+            }
+            cv::Mat imRight = cv::imread(sRight, cv::IMREAD_UNCHANGED);
+            if(useClahe && !im.empty() && im.channels()==1)   clahe->apply(im, im);
+            if(useClahe && !imRight.empty() && imRight.channels()==1) clahe->apply(imRight, imRight);
+            if(imRight.empty()){
+                cerr << "[Debug] mono_rig FATAL: missing rear image " << sRight << endl;
+                return 1;
+            }
 
             double tframe = vTimestampsCam[seq][ni];
 
@@ -195,7 +230,7 @@ int main(int argc, char *argv[])
 
             // Pass the image to the SLAM system
             // cout << "tframe = " << tframe << endl;
-            SLAM.TrackMonocular(im,tframe,vImuMeas); // TODO change to monocular_inertial
+            SLAM.TrackMonoRig(im,imRight,tframe,vImuMeas);
             SLAM.DumpFrameKeypoints();
 
     #ifdef COMPILEDWITHC11
@@ -242,6 +277,7 @@ int main(int argc, char *argv[])
         SLAM.CloseKeypointDump();
         const string mp_file =  "mp_" + string(argv[argc-1]) + ".csv";
         SLAM.SaveMapPoints(mp_file);
+        SLAM.SaveMapLines("ml_" + string(argv[argc-1]) + ".csv");
         const string kf_file =  "kf_" + string(argv[argc-1]) + ".txt";
         const string f_file =  "f_" + string(argv[argc-1]) + ".txt";
         SLAM.SaveTrajectoryEuRoC(f_file);
