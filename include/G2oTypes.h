@@ -339,6 +339,74 @@ public:
     }
 };
 
+
+/**
+ * Line residual against a FIXED 3D line, optimising the pose only.
+ *
+ * A world line (direction d, moment m) seen by camera cam_idx of the rig
+ * produces the great-circle normal   n_c = R m + t x (R d).  An observed
+ * endpoint bearing b lies on the line iff n_c . b = 0, so the residual is
+ *
+ *     e = [ n_c . b1 , n_c . b2 ]
+ *
+ * with n_c normalised. Two rows, one per observed endpoint.
+ *
+ * WHY THIS FORM: it is invariant to sliding ALONG the line. A line gives one
+ * constraint, not two, and any residual that pretends to localise a point along
+ * an edge is fitting noise -- that is the aperture problem, and it is why the
+ * endpoints are used only as bearings ON the plane, never as matched points.
+ */
+class EdgeLineOnlyPose : public g2o::BaseUnaryEdge<2, Eigen::Vector2d, VertexPose>
+{
+public:
+    EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+
+    EdgeLineOnlyPose(const Eigen::Vector3f &d_w, const Eigen::Vector3f &m_w,
+                     const Eigen::Vector3f &b1, const Eigen::Vector3f &b2,
+                     int cam_idx_ = 0, float createParallax = 0.f)
+        : dw(d_w.cast<double>()), mw(m_w.cast<double>()),
+          bb1(b1.cast<double>().normalized()), bb2(b2.cast<double>().normalized()),
+          cam_idx(cam_idx_), parallax(createParallax) {}
+
+    virtual bool read(std::istream &is) { return false; }
+    virtual bool write(std::ostream &os) const { return false; }
+
+    void computeError()
+    {
+        const VertexPose *VP = static_cast<const VertexPose *>(_vertices[0]);
+        const Eigen::Matrix3d &Rcw = VP->estimate().Rcw[cam_idx];
+        const Eigen::Vector3d &tcw = VP->estimate().tcw[cam_idx];
+        Eigen::Vector3d n = Rcw * mw + tcw.cross(Rcw * dw);
+        const double nn = n.norm();
+        if (nn < 1e-9) { _error.setZero(); return; }
+        n /= nn;
+        _error << n.dot(bb1), n.dot(bb2);
+    }
+
+    /// Cheirality for a line: intersect both observed bearings with the
+    /// landmark in THIS camera; both must be at positive depth. The n.b
+    /// residual is mirror-invariant, so without this a landmark behind the
+    /// camera scores like one in front.
+    bool isDepthPositive()
+    {
+        const VertexPose *VP = static_cast<const VertexPose *>(_vertices[0]);
+        const Eigen::Matrix3d &Rcw = VP->estimate().Rcw[cam_idx];
+        const Eigen::Vector3d &tcw = VP->estimate().tcw[cam_idx];
+        const Eigen::Vector3d d_c = Rcw * dw;
+        const Eigen::Vector3d m_c = Rcw * mw + tcw.cross(d_c);
+        for(const Eigen::Vector3d* b : {&bb1, &bb2}){
+            const Eigen::Vector3d cr = b->cross(d_c);
+            const double den = cr.squaredNorm();
+            if(den < 1e-12 || m_c.dot(cr)/den <= 0.0) return false;
+        }
+        return true;
+    }
+
+    Eigen::Vector3d dw, mw, bb1, bb2;
+    int cam_idx;
+    float parallax = 0.f;   ///< creation parallax [rad]
+};
+
 class EdgeMono : public g2o::BaseBinaryEdge<2,Eigen::Vector2d,g2o::VertexSBAPointXYZ,VertexPose>
 {
 public:

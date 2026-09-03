@@ -18,6 +18,7 @@
 
 
 #include "Optimizer.h"
+#include "MapLine.h"
 
 
 #include <complex>
@@ -44,6 +45,11 @@
 
 namespace ORB_SLAM3
 {
+
+/// Withhold point edges from the inertial pose optimizer, so IMU + lines alone
+/// fix the pose. Set from Lines.only in the settings file.
+bool Optimizer::bLinesOnly = false;
+
 bool sortByVal(const pair<MapPoint*, int> &a, const pair<MapPoint*, int> &b)
 {
     return (a.second < b.second);
@@ -4649,6 +4655,38 @@ int Optimizer::PoseInertialOptimizationLastKeyFrame(Frame *pFrame, bool bRecInit
             }
         }
     }
+    // ---- spherical line edges: SAME as PoseInertialOptimizationLastFrame.
+    // This optimizer previously had ZERO line edges, so the estimator
+    // alternated between seeing and not seeing lines depending on which pose
+    // path ran -- a joint point+line estimator must use both everywhere.
+    int nLineEdgesK = 0;
+    std::vector<EdgeLineOnlyPose*> vpEdgesLineK;
+    std::vector<size_t> vnIndexEdgeLineK;
+    if(!pFrame->mvLines.empty() && !pFrame->mvpMapLines.empty())
+    {
+        const float f0 = pFrame->mpCamera ? pFrame->mpCamera->getParameter(0) : 400.f;
+        const double infoLineK = double(f0) * double(f0) / 9.0;   // sigma = 3 px
+        for(size_t i = 0; i < pFrame->mvLines.size() && i < pFrame->mvpMapLines.size(); i++)
+        {
+            MapLine* pML = pFrame->mvpMapLines[i];
+            if(!pML || pML->isBad() || pML->mnValidated < 2) continue;
+            const LineObs &lo = pFrame->mvLines[i];
+            EdgeLineOnlyPose* el = new EdgeLineOnlyPose(
+                pML->GetDirection(), pML->GetMoment(), lo.b1u, lo.b2u, lo.cam,
+                pML->mCreateParallax);
+            el->setVertex(0, VP);
+            el->setMeasurement(Eigen::Vector2d::Zero());
+            el->setInformation(Eigen::Matrix2d::Identity() * infoLineK);
+            g2o::RobustKernelHuber* rkl = new g2o::RobustKernelHuber;
+            el->setRobustKernel(rkl);
+            rkl->setDelta(sqrt(5.991));
+            optimizer.addEdge(el);
+            vpEdgesLineK.push_back(el);
+            vnIndexEdgeLineK.push_back(i);
+            nLineEdgesK++;
+        }
+    }
+
     nInitialCorrespondences = nInitialMonoCorrespondences + nInitialStereoCorrespondences;
 
     KeyFrame* pKF = pFrame->mpLastKeyFrame;
@@ -4780,6 +4818,21 @@ int Optimizer::PoseInertialOptimizationLastKeyFrame(Frame *pFrame, bool bRecInit
 
             if(it==2)
                 e->setRobustKernel(0);
+        }
+
+        for(size_t i=0, iend=vpEdgesLineK.size(); i<iend; i++)
+        {
+            EdgeLineOnlyPose* el = vpEdgesLineK[i];
+            const size_t idx = vnIndexEdgeLineK[i];
+            if(idx < pFrame->mvbLineOutlier.size() && pFrame->mvbLineOutlier[idx])
+                el->computeError();
+            const float chi2l = el->chi2();
+            const bool bad = (chi2l > chi2Mono[it]) || !el->isDepthPositive();
+            if(idx < pFrame->mvbLineOutlier.size())
+                pFrame->mvbLineOutlier[idx] = bad;
+            el->setLevel(bad ? 1 : 0);
+            if(it == 2)
+                el->setRobustKernel(0);
         }
 
         nInliers = nInliersMono + nInliersStereo;
@@ -4927,7 +4980,12 @@ int Optimizer::PoseInertialOptimizationLastFrame(Frame *pFrame, bool bRecInit)
     {
         unique_lock<mutex> lock(MapPoint::mGlobalMutex);
 
-        for(int i=0; i<N; i++)
+        // LINES-ONLY ISOLATION (Optimizer::bLinesOnly). Withhold every point
+        // edge so the pose is fixed by IMU + line constraints alone. If the
+        // line geometry is right this still tracks; if it diverges, the fault
+        // is in the lines and not in some interaction with the points. Points
+        // are still tracked and mapped -- only their EDGES are withheld here.
+        for(int i=0; i<N && !bLinesOnly; i++)
         {
             MapPoint* pMP = pFrame->mvpMapPoints[i];
             if(pMP)
@@ -5033,7 +5091,84 @@ int Optimizer::PoseInertialOptimizationLastFrame(Frame *pFrame, bool bRecInit)
         }
     }
 
+
+    // ---- spherical line constraints ---------------------------------------
+    // A line contributes n_c . b for each observed endpoint bearing, where
+    //   n_c = Rcw * m + tcw x (Rcw * d)
+    // is the great-circle normal of the world line (d,m) in THIS camera. The
+    // camera index comes from the observation itself, so rear-lens lines are
+    // projected through the rig's camera 1, never camera 0.
+    //
+    // Information: the residual is a SINE of an angle, so its noise is roughly
+    // the angular uncertainty of an endpoint bearing -- about one pixel over
+    // the focal length. sigma = 1/f, hence information = f^2.
+    int nLineEdges = 0;
+    std::vector<EdgeLineOnlyPose*> vpEdgesLine;
+    std::vector<size_t> vnIndexEdgeLine;
+    if(!pFrame->mvLines.empty() && !pFrame->mvpMapLines.empty())
+    {
+        const float f0 = pFrame->mpCamera ? pFrame->mpCamera->getParameter(0) : 400.f;
+        const double infoLine = double(f0) * double(f0);
+        for(size_t i = 0; i < pFrame->mvLines.size() && i < pFrame->mvpMapLines.size(); i++)
+        {
+            MapLine* pML = pFrame->mvpMapLines[i];
+            if(!pML || pML->isBad()) continue;
+            const LineObs &lo = pFrame->mvLines[i];
+            if(pML->mnValidated < 2) continue;   // FIX 4: probation (below)
+            EdgeLineOnlyPose* el = new EdgeLineOnlyPose(
+                pML->GetDirection(), pML->GetMoment(), lo.b1u, lo.b2u, lo.cam,
+                pML->mCreateParallax);
+            el->setVertex(0, VP);
+            el->setMeasurement(Eigen::Vector2d::Zero());
+            // FIX 3: the landmark is NOT noiseless. Its plane was triangulated
+            // from two sigma_b-noisy planes meeting at angle theta_p, so the
+            // residual's variance is sigma_b^2*(1 + 1/sin^2(theta_p)):
+            //   info = f^2 * s^2/(1+s^2),   s = sin(creation parallax).
+            // The old flat f^2 asserted pixel-perfect landmarks, which made a
+            // 2-deg-parallax line pull as hard as a well-conditioned one --
+            // measured as whitened chi2 ~13 even for HONEST lines (points: ~3).
+            // Calibrated empirically, not derived: under info=f^2 the HONEST
+            // lines (validated, low-parallax bucket) ran at whitened chi2
+            // median ~13 where a correct 2-dof model gives 1.386 -- so the
+            // real angular noise is ~3 px equivalent, roughly parallax-flat
+            // (the parallax-dependent tail is mismatches, which probation,
+            // cheirality and the chi2 rounds handle). sigma = 3 px:
+            const double infoThis = infoLine / 9.0;
+            el->setInformation(Eigen::Matrix2d::Identity() * infoThis);
+            g2o::RobustKernelHuber* rkl = new g2o::RobustKernelHuber;
+            el->setRobustKernel(rkl);
+            // g2o compares delta against the CHI2 (residual x information), not
+            // against the raw residual. With information = f^2 the old 0.02 --
+            // written intending "1.1 deg" -- actually meant 0.009 PIXELS, so
+            // every line sat in Huber's saturated branch where the gradient
+            // magnitude is constant: a badly wrong line pulled exactly as hard
+            // as a perfect one, and ~2000 of them per frame outvoted the point
+            // inliers. Lines carry no scale information, so outvoting the IMU
+            // that way collapsed metric scale (path length 2x, scale 0.12).
+            // sqrt(5.991) is the 2-DoF chi2 95% threshold -- the same
+            // convention the point edges use, so lines and points are now
+            // statistically comparable.
+            rkl->setDelta(sqrt(5.991));
+            optimizer.addEdge(el);
+            vpEdgesLine.push_back(el);
+            vnIndexEdgeLine.push_back(i);
+            nLineEdges++;
+        }
+    }
+
+    {   // PROOF: how many line edges does the pose optimizer actually receive?
+        static long nCalls = 0, nEdgesTotal = 0, nCallsWithLines = 0;
+        nCalls++; nEdgesTotal += nLineEdges;
+        if(nLineEdges > 0) nCallsWithLines++;
+        if(nCalls % 100 == 0)
+            std::cout << "[Debug] LineEdges: " << nCallsWithLines << "/" << nCalls
+                      << " optimizer calls had ANY line edge; " << nEdgesTotal
+                      << " line edges total" << std::endl;
+    }
+
     nInitialCorrespondences = nInitialMonoCorrespondences + nInitialStereoCorrespondences;
+    if(bLinesOnly)
+        nInitialCorrespondences += nLineEdges;   // matched by nInliersLine below
 
     // Set Previous Frame Vertex
     Frame* pFp = pFrame->mpPrevFrame;
@@ -5180,6 +5315,45 @@ int Optimizer::PoseInertialOptimizationLastFrame(Frame *pFrame, bool bRecInit)
                 e->setRobustKernel(0);
         }
 
+        // LINES GET THE SAME DISCIPLINE AS POINTS.
+        //
+        // Point edges are chi2-tested after every round and excluded when they
+        // disagree (setLevel(1)), and at it==2 they lose their robust kernel so
+        // the survivors are fit hard. Line edges used to get none of that: they
+        // stayed at level 0 for all four rounds however wrong they were, and
+        // kept their kernel throughout.
+        //
+        // That asymmetry is what destroyed the combination. Round 1, a bad line
+        // shifts the pose; the points that disagree with that shifted pose blow
+        // past chi2 and are dropped; rounds 2-4 run on whatever points still
+        // agree with the lines. The lines became an unfilterable prior that
+        // pruned the points into agreeing with them -- which is why points
+        // alone worked, lines alone worked, and together they diverged.
+        //
+        // The residual is 2-DoF like a monocular point, so it takes the same
+        // 5.991 threshold.
+        int nBadLine = 0, nInliersLine = 0;
+        for(size_t i=0, iend=vpEdgesLine.size(); i<iend; i++)
+        {
+            EdgeLineOnlyPose* el = vpEdgesLine[i];
+            const size_t idx = vnIndexEdgeLine[i];
+            if(idx < pFrame->mvbLineOutlier.size() && pFrame->mvbLineOutlier[idx])
+                el->computeError();
+            const float chi2l = el->chi2();
+            const bool bad = (chi2l > chi2Mono[it]) || !el->isDepthPositive();
+            if(idx < pFrame->mvbLineOutlier.size())
+                pFrame->mvbLineOutlier[idx] = bad;
+            el->setLevel(bad ? 1 : 0);
+            if(bad) nBadLine++; else nInliersLine++;
+            if(it == 2)
+                el->setRobustKernel(0);
+        }
+        if(bLinesOnly)
+        {
+            nInliersMono += nInliersLine;      // else the caller reads 0 inliers
+            nBadMono     += nBadLine;
+        }
+
         nInliers = nInliersMono + nInliersStereo;
         nBad = nBadMono + nBadStereo;
 
@@ -5220,7 +5394,52 @@ int Optimizer::PoseInertialOptimizationLastFrame(Frame *pFrame, bool bRecInit)
         }
     }
 
+    {   // [AUDIT-E] after optimization: whitened chi2 by SOURCE. If rear-lens
+        // (cam 1) line edges are systematically worse than front, the rig
+        // transform inside the vertex (Rcw[1] via Trl) is wrong; if BOTH are
+        // huge next to points, the landmark geometry is wrong.
+        static std::vector<double> c0, c1, cp; static long nCall = 0;
+        static std::vector<double> bk[4];   // parallax buckets: <3, 3-5, 5-10, >10 deg
+        for(size_t i=0; i<vpEdgesLine.size(); i++){
+            vpEdgesLine[i]->computeError();
+            (vpEdgesLine[i]->cam_idx == 0 ? c0 : c1).push_back(vpEdgesLine[i]->chi2());
+            const double pdeg = 180.0/M_PI * vpEdgesLine[i]->parallax;
+            bk[pdeg < 3 ? 0 : pdeg < 5 ? 1 : pdeg < 10 ? 2 : 3].push_back(vpEdgesLine[i]->chi2());
+        }
+        for(size_t i=0; i<vpEdgesMono.size(); i++){
+            vpEdgesMono[i]->computeError();
+            cp.push_back(vpEdgesMono[i]->chi2());
+        }
+        if(++nCall % 200 == 0){
+            auto med=[](std::vector<double>& v)->double{
+                if(v.empty()) return -1;
+                std::nth_element(v.begin(), v.begin()+v.size()/2, v.end());
+                return v[v.size()/2]; };
+            std::cout << "[AUDIT] optimizer chi2 median -- POINT " << med(cp)
+                      << " | LINE cam0 " << med(c0) << " (" << c0.size()
+                      << ") | LINE cam1 " << med(c1) << " (" << c1.size() << ")"
+                      << std::endl;
+            std::cout << "[AUDIT] line chi2 by CREATION PARALLAX -- <3deg "
+                      << med(bk[0]) << " (" << bk[0].size() << ") | 3-5 "
+                      << med(bk[1]) << " (" << bk[1].size() << ") | 5-10 "
+                      << med(bk[2]) << " (" << bk[2].size() << ") | >10 "
+                      << med(bk[3]) << " (" << bk[3].size() << ")" << std::endl;
+            c0.clear(); c1.clear(); cp.clear();
+            for(auto& b : bk) b.clear();
+        }
+    }
+
     nInliers = nInliersMono + nInliersStereo;
+
+    // A line that never came back inside chi2 is not this line: forget the
+    // association so the next frame re-triangulates instead of inheriting it.
+    for(size_t i=0, iend=vnIndexEdgeLine.size(); i<iend; i++)
+    {
+        const size_t idx = vnIndexEdgeLine[i];
+        if(idx < pFrame->mvbLineOutlier.size() && pFrame->mvbLineOutlier[idx]
+           && idx < pFrame->mvpMapLines.size())
+            pFrame->mvpMapLines[idx] = static_cast<MapLine*>(NULL);
+    }
 
 
     // Recover optimized pose, velocity and biases

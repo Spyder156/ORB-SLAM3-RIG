@@ -46,6 +46,10 @@ class LoopClosing;
 class Optimizer
 {
 public:
+    /// Lines-only isolation: withhold point edges from the inertial pose
+    /// optimizer so the line constraints can be judged on their own.
+    static bool bLinesOnly;
+
 
     void static BundleAdjustment(const std::vector<KeyFrame*> &vpKF, const std::vector<MapPoint*> &vpMP,
                                  int nIterations = 5, bool *pbStopFlag=NULL, const unsigned long nLoopKF=0,
