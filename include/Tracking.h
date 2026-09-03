@@ -281,11 +281,24 @@ protected:
     bool mbUseLines = false;
     std::vector<LineObs> mvPrevLines;      ///< previous frame, for tracking
     long mnLineMatches = 0, mnLineTotal = 0, mnLineTriangulated = 0;
-    long mnLineObs = 0, mnLineRej = 0;
+    long mnLineObs = 0, mnLineRej = 0, mnLineInherited = 0;
+    // stage-audit accumulators (Track thread only)
+    double audNAng = 0, audPxMove = 0, audParallax = 0;
+    long audNMatch = 0, audNTri = 0, audCheirNeg = 0, audCheirTot = 0;
+    long audTriStale = 0, audTriTot2 = 0;
+    /// Max angular residual for REUSING an existing MapLine (~1.1 deg).
+    float mfLineReobsMaxRad = 0.02f;
 
     /// Minimum inliers before a visual update may override IMU propagation
     /// while RECENTLY_LOST. Upstream hardcodes 10.
     int mnRecentlyLostMinInliers = 10;
+
+    /// Below this many inliers the FRAME is blind, not the landmarks: the
+    /// visibility ticks charged this frame are refunded so MapPointCulling()
+    /// does not destroy the landmarks that would bridge the gap.
+    int mnBlindInliers = 20;
+    long mnBlindFrames = 0;
+    std::vector<MapPoint*> mvpChargedVisible;
     std::vector<int> mvLineAssign;   ///< cur->prev line match, computed pre-Track()
 
     //BoW

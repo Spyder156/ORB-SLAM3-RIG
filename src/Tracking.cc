@@ -618,6 +618,25 @@ void Tracking::newParameterLoader(Settings *settings) {
     // crash inside a std::thread, with no error printed at all.
     if(mSensor==System::STEREO || mSensor==System::IMU_STEREO || mpSystem->mRig.IsEnabled())
         mpORBextractorRight = new ORBextractor(nFeatures,fScaleFactor,nLevels,fIniThFAST,fMinThFAST);
+    {   // ---- lines-only isolation ----
+        cv::FileStorage lfs(mStrSettingPath, cv::FileStorage::READ);
+        if(lfs.isOpened() && !lfs["Lines.only"].empty() && (int)lfs["Lines.only"] != 0){
+            Optimizer::bLinesOnly = true;
+            std::cout << "[Debug] Lines.only=1: point edges WITHHELD from the "
+                         "pose optimizer; IMU + lines alone fix the pose"
+                      << std::endl;
+        }
+    }
+
+    {   // ---- what counts as a frame the camera could not see in ----
+        cv::FileStorage bfs(mStrSettingPath, cv::FileStorage::READ);
+        if(bfs.isOpened() && !bfs["Tracking.blindInliers"].empty())
+            mnBlindInliers = (int)bfs["Tracking.blindInliers"];
+        std::cout << "[Debug] Tracking: frames under " << mnBlindInliers
+                  << " inliers are treated as blind (visibility refunded)"
+                  << std::endl;
+    }
+
     {   // ---- how hard the IMU should carry a visual dropout ----
         cv::FileStorage tfs(mStrSettingPath, cv::FileStorage::READ);
         if(tfs.isOpened() && !tfs["Tracking.recentlyLostMinInliers"].empty())
@@ -1730,6 +1749,46 @@ Sophus::SE3f Tracking::GrabImageMonoRig(const cv::Mat &im0, const cv::Mat &im1,
         mCurrentFrame.mvbLineOutlier.assign(mCurrentFrame.mvLines.size(), false);
 
         mvLineAssign = mpLineExtractor->Match(mCurrentFrame.mvLines, mvPrevLines);
+
+        // CARRY THE LANDMARK ASSOCIATIONS INTO THIS FRAME, BEFORE Track().
+        //
+        // This is the link that was missing. mvpMapLines was wiped to null just
+        // above, Track() ran the pose optimizer -- which skips every entry with
+        // `if(!pML) continue` -- and only AFTER that did the block below attach
+        // landmarks. So the associations existed on every frame except the one
+        // moment they were needed, and ZERO line edges ever reached the
+        // optimizer: verified as 0/400 optimizer calls with any line edge.
+        //
+        // The match above already says which previous line each current line
+        // is, and the previous line already carries its MapLine and its anchor
+        // view. Inheriting both here is all that was needed. Triangulation of
+        // genuinely NEW lines still happens after Track(), because that needs a
+        // pose which does not exist yet.
+        {
+            long nInherit = 0;
+            for(size_t i = 0; i < mvLineAssign.size(); ++i)
+            {
+                const int j = mvLineAssign[i];
+                if(j < 0 || j >= (int)mvPrevLines.size()) continue;
+                LineObs &cur = mCurrentFrame.mvLines[i];
+                const LineObs &prv = mvPrevLines[j];
+                if(prv.hasAnchor)
+                {
+                    cur.hasAnchor = true;
+                    cur.nAnchor = prv.nAnchor;
+                    cur.RAnchor = prv.RAnchor;
+                    cur.tAnchor = prv.tAnchor;
+                    cur.anchorMapVersion = prv.anchorMapVersion;
+                }
+                if(prv.pML && !prv.pML->isBad())
+                {
+                    cur.pML = prv.pML;
+                    mCurrentFrame.mvpMapLines[i] = prv.pML;
+                    nInherit++;
+                }
+            }
+            mnLineInherited += nInherit;
+        }
         const std::vector<int> &a = mvLineAssign;
         long m = 0;
         for(size_t i = 0; i < a.size(); ++i) if(a[i] >= 0) ++m;
@@ -1740,8 +1799,22 @@ Sophus::SE3f Tracking::GrabImageMonoRig(const cv::Mat &im0, const cv::Mat &im1,
                       << mCurrentFrame.mvLines.size() << " (cam0 " << l0.size()
                       << " cam1 " << l1.size() << ")  matched " << m
                       << "  MapLines " << mnLineTriangulated
-                      << " (reobs " << mnLineObs << ", rejected " << mnLineRej << ")"
-                      << std::endl;
+                      << " (reobs " << mnLineObs << ", rejected " << mnLineRej
+                      << ", inherited " << mnLineInherited << ")" << std::endl;
+            if(audNMatch > 0 || audNTri > 0){
+                std::cout << "[AUDIT] match: dNormal "
+                          << (audNMatch? 180.0/M_PI*audNAng/audNMatch : 0)
+                          << " deg, dPix " << (audNMatch? audPxMove/audNMatch : 0)
+                          << " px (" << audNMatch << ")"
+                          << " | tri parallax "
+                          << (audNTri? 180.0/M_PI*audParallax/audNTri : 0)
+                          << " deg (" << audNTri << " attempts)"
+                          << " | cheirality: " << audCheirNeg << "/" << audCheirTot
+                          << " new lines BEHIND their camera"
+                          << " | STALE anchors at triangulation: " << audTriStale
+                          << "/" << audTriTot2 << std::endl;
+                audNAng = audPxMove = audParallax = 0; audNMatch = audNTri = 0;
+            }
         // ---- create / carry MapLines -------------------------------------
         // Triangulate a tracked line from the two poses that observed it. The
         // conventions that matter here:
@@ -1783,6 +1856,7 @@ Sophus::SE3f Tracking::GrabImageMonoRig(const cv::Mat &im0, const cv::Mat &im1,
                     // new track: anchor it here
                     cur.hasAnchor = true; cur.nAnchor = cur.n;
                     cur.RAnchor = Tc.rotationMatrix(); cur.tAnchor = Tc.translation();
+                    cur.anchorMapVersion = mpAtlas->GetCurrentMap()->GetWorldFrameVersion();
                     continue;
                 }
                 const LineObs &prv = mvPrevLines[a[i]];
@@ -1790,20 +1864,126 @@ Sophus::SE3f Tracking::GrabImageMonoRig(const cv::Mat &im0, const cv::Mat &im1,
                 if(!prv.hasAnchor){
                     cur.hasAnchor = true; cur.nAnchor = cur.n;
                     cur.RAnchor = Tc.rotationMatrix(); cur.tAnchor = Tc.translation();
+                    cur.anchorMapVersion = mpAtlas->GetCurrentMap()->GetWorldFrameVersion();
                     continue;
                 }
-                // carry the anchor AND the landmark forward
-                cur.hasAnchor = true; cur.nAnchor = prv.nAnchor;
-                cur.RAnchor = prv.RAnchor; cur.tAnchor = prv.tAnchor;
-                cur.pML = prv.pML;
+                // anchor and landmark were already inherited before Track();
+                // only fill an anchor here if the previous line never had one.
+                if(!cur.hasAnchor)
+                {
+                    cur.hasAnchor = true; cur.nAnchor = prv.nAnchor;
+                    cur.RAnchor = prv.RAnchor; cur.tAnchor = prv.tAnchor;
+                    cur.anchorMapVersion = prv.anchorMapVersion;
+                }
 
+                {   // [AUDIT-B] match quality on CONSECUTIVE frames: the
+                    // angle between the two camera-frame normals and how far
+                    // the endpoints moved in pixels. 33 ms apart, both should
+                    // be small; large values = the matcher grabbed a different
+                    // physical line.
+                    const LineObs &pv = mvPrevLines[a[i]];
+                    audNAng += std::asin(std::min(1.f,
+                        cur.n.cross(pv.n).norm()));
+                    audPxMove += cv::norm(cur.p1 - pv.p1);
+                    audNMatch++;
+                }
                 if(cur.pML){
                     // Already a landmark: this is another OBSERVATION of it, not
                     // a new line. Minting a fresh MapLine per frame is what
                     // produced 357k landmarks for ~1400 tracked lines.
+                    //
+                    // VALIDATE IT. The landmark is carried forward by the line
+                    // tracker (cur.pML = prv.pML), and with ~2000 segments per
+                    // frame and 3 deg / 8 deg matching gates a track drifts onto
+                    // a neighbouring edge easily. Previously every reobservation
+                    // was accepted unchecked -- 712k of them -- so one drifted
+                    // track injected a confident constraint for the rest of the
+                    // run. Unlike the creation gate this is NOT circular: the
+                    // landmark comes from earlier frames, so requiring it to
+                    // still explain what the camera sees now is real evidence.
                     if(!cur.pML->isBad()){
+                        const float r1 = cur.pML->AngularError(
+                            Tc.rotationMatrix(), Tc.translation(), cur.b1u);
+                        const float r2 = cur.pML->AngularError(
+                            Tc.rotationMatrix(), Tc.translation(), cur.b2u);
+                        // direction + cheirality on reuse
+                        bool behind = false;
+                        {
+                            const Eigen::Vector3f d_chk =
+                                Tc.rotationMatrix() * cur.pML->GetDirection();
+                            if(std::fabs(d_chk.dot(cur.dir)) < 0.9659f)
+                                behind = true;    // direction contradicts obs
+                        }
+                        {
+                            const Eigen::Vector3f d_c =
+                                Tc.rotationMatrix() * cur.pML->GetDirection();
+                            const Eigen::Vector3f m_c =
+                                Tc.rotationMatrix() * cur.pML->GetMoment()
+                                + Tc.translation().cross(d_c);
+                            for(const Eigen::Vector3f& b : {cur.b1u, cur.b2u}){
+                                const Eigen::Vector3f cr = b.cross(d_c);
+                                const float den = cr.squaredNorm();
+                                if(den < 1e-10f || m_c.dot(cr)/den <= 0.f){
+                                    behind = true; break;
+                                }
+                            }
+                        }
+                        if(behind || std::max(r1, r2) > mfLineReobsMaxRad){
+                            cur.pML = nullptr;    // track drifted off the line
+                            nRej++;
+                            continue;
+                        }
                         mCurrentFrame.mvpMapLines[i] = cur.pML;
                         cur.pML->mnVisible++;
+                        cur.pML->mnValidated++;   // survived gate + cheirality
+
+                        {   // LINES AGE LIKE POINTS, not like snapshots.
+                            MapLine* pL = cur.pML;
+                            // (a) re-triangulate on the widest baseline seen:
+                            // the first observation is kept, and when today's
+                            // parallax beats the creation parallax by 20% the
+                            // line is solved again -- depth sharpens with age.
+                            if(pL->mbHasFirst){
+                                const Eigen::Vector3f n1w =
+                                    Tc.rotationMatrix().transpose() * cur.n;
+                                const Eigen::Vector3f n2w =
+                                    pL->mFirstR.transpose() * pL->mFirstN;
+                                const float sinp = std::min(1.f,
+                                    n1w.cross(n2w).norm());
+                                if(std::asin(sinp) > 1.2f * pL->mCreateParallax){
+                                    Eigen::Vector3f dw2, mw2;
+                                    if(MapLine::Triangulate(cur.n,
+                                           Tc.rotationMatrix(), Tc.translation(),
+                                           pL->mFirstN, pL->mFirstR, pL->mFirstT,
+                                           2.0f, dw2, mw2)){
+                                        const Eigen::Vector3f d_c2 =
+                                            Tc.rotationMatrix() * dw2;
+                                        const Eigen::Vector3f m_c2 =
+                                            Tc.rotationMatrix() * mw2
+                                            + Tc.translation().cross(d_c2);
+                                        bool ok2 =
+                                            std::fabs(d_c2.dot(cur.dir)) >= 0.9659f;
+                                        for(const Eigen::Vector3f& b :
+                                                {cur.b1u, cur.b2u}){
+                                            const Eigen::Vector3f cr = b.cross(d_c2);
+                                            const float den = cr.squaredNorm();
+                                            if(den < 1e-10f ||
+                                               m_c2.dot(cr)/den <= 0.f) ok2 = false;
+                                        }
+                                        if(ok2){
+                                            pL->SetPlucker(dw2, mw2);
+                                            pL->mCreateParallax = std::asin(sinp);
+                                            pL->mbHasExtent = false;  // re-grow
+                                        }
+                                    }
+                                }
+                            }
+                            // (b) extent union: this sighting's piece extends
+                            // the landmark instead of being thrown away
+                            pL->SetExtentFromBearings(Tc.rotationMatrix(),
+                                                      Tc.translation(),
+                                                      cur.b1u, cur.b2u);
+                        }
                         nObs++;
                     } else {
                         cur.pML = nullptr;
@@ -1811,11 +1991,78 @@ Sophus::SE3f Tracking::GrabImageMonoRig(const cv::Mat &im0, const cv::Mat &im1,
                     continue;
                 }
 
+                {   // The anchor pose is a snapshot of the world frame at
+                    // anchor time. Any map change since (VIBA scale/gravity,
+                    // local BA, loop closure) moved that frame, so the two
+                    // poses fed to Triangulate would disagree about "world" --
+                    // 54% of attempts did. RE-ANCHOR at the current
+                    // observation instead: parallax restarts from zero in the
+                    // CURRENT frame, which loses a little baseline and no
+                    // correctness.
+                    const int nowV = mpAtlas->GetCurrentMap()->GetWorldFrameVersion();
+                    audTriTot2++;
+                    if(cur.anchorMapVersion >= 0 && cur.anchorMapVersion != nowV)
+                    {
+                        audTriStale++;
+                        cur.nAnchor = cur.n;
+                        cur.RAnchor = Tc.rotationMatrix();
+                        cur.tAnchor = Tc.translation();
+                        cur.anchorMapVersion = nowV;
+                        continue;
+                    }
+                }
+                {   // [AUDIT-C] parallax between the two interpretation
+                    // planes, in the WORLD frame -- the quantity the 2 deg
+                    // gate tests.
+                    const Eigen::Vector3f n1w = Tc.rotationMatrix().transpose() * cur.n;
+                    const Eigen::Vector3f n2w = cur.RAnchor.transpose() * cur.nAnchor;
+                    audParallax += std::asin(std::min(1.f, n1w.cross(n2w).norm()));
+                    audNTri++;
+                }
                 Eigen::Vector3f dw, mw;
                 if(!MapLine::Triangulate(cur.n, Tc.rotationMatrix(), Tc.translation(),
                                          cur.nAnchor, cur.RAnchor, cur.tAnchor,
                                          2.0f, dw, mw))
                     continue;      // still too little angle -- keep accumulating
+
+                {   // DIRECTION GATE. The residual n.b constrains only the
+                    // PLANE; the direction d inside it is unchecked anywhere
+                    // (the aperture problem), and at ~2 deg parallax
+                    // d = n1 x n2 is noise-dominated. But the OBSERVED chord
+                    // b2-b1 lies in the same plane and points along the real
+                    // line, so the triangulated direction must agree with it.
+                    // Measured before this gate: 8.6% of dumped lines were
+                    // >5 m long and 79% of those ran along the view ray --
+                    // random directions exploding the bearing-intersection.
+                    const Eigen::Vector3f d_chk = Tc.rotationMatrix() * dw;
+                    if(std::fabs(d_chk.dot(cur.dir)) < 0.9659f){  // > 15 deg off
+                        nRej++;
+                        continue;
+                    }
+                }
+                {   // CHEIRALITY GATE. Two interpretation planes meet in
+                    // exactly one line; if that line is where the camera looked
+                    // it intersects both observed bearings at POSITIVE depth.
+                    // s<=0 means the planes did not describe one physical line
+                    // (noise flipped a marginal-parallax intersection to the
+                    // mirror side) -- measured at 41% of creations before this
+                    // gate. The residual n.b is mirror-invariant, so no other
+                    // equation in the pipeline can catch it. REJECT, never
+                    // flip: the intersection is unique, a mirrored landmark is
+                    // not a landmark. Points get this from isDepthPositive();
+                    // this is the line pipeline's equivalent.
+                    const Eigen::Vector3f d_c = Tc.rotationMatrix() * dw;
+                    const Eigen::Vector3f m_c = Tc.rotationMatrix() * mw
+                                              + Tc.translation().cross(d_c);
+                    int neg = 0;
+                    for(const Eigen::Vector3f& b : {cur.b1u, cur.b2u}){
+                        const Eigen::Vector3f cr = b.cross(d_c);
+                        const float den = cr.squaredNorm();
+                        if(den < 1e-10f || m_c.dot(cr)/den <= 0.f) neg++;
+                    }
+                    audCheirTot++;
+                    if(neg > 0){ audCheirNeg++; nRej++; continue; }
+                }
 
                 // Sanity before admitting it to the map: the new landmark must
                 // actually explain the observation that created it. A line that
@@ -1829,6 +2076,20 @@ Sophus::SE3f Tracking::GrabImageMonoRig(const cv::Mat &im0, const cv::Mat &im1,
                     nRej++;
                     continue;
                 }
+                pML->mAngLen = cur.angLen;
+                pML->mFirstN = cur.nAnchor;
+                pML->mFirstR = cur.RAnchor;
+                pML->mFirstT = cur.tAnchor;
+                pML->mbHasFirst = true;
+                {
+                    const Eigen::Vector3f n1w = Tc.rotationMatrix().transpose() * cur.n;
+                    const Eigen::Vector3f n2w = cur.RAnchor.transpose() * cur.nAnchor;
+                    pML->mCreateParallax = std::asin(std::min(1.f, n1w.cross(n2w).norm()));
+                }
+                // record WHERE ON THE LINE this camera saw it
+                pML->SetExtentFromBearings(Tc.rotationMatrix(), Tc.translation(),
+                                           cur.b1u, cur.b2u);
+                mpAtlas->GetCurrentMap()->AddMapLine(pML);
                 cur.pML = pML;
                 mCurrentFrame.mvpMapLines[i] = pML;
                 nNew++;
@@ -3310,6 +3571,33 @@ bool Tracking::TrackLocalMap()
         }
     }
 
+    // A landmark's mnVisible counts every frame it PROJECTED INTO VIEW; mnFound
+    // counts the frames it was actually matched. MapPointCulling() kills any
+    // young landmark whose ratio falls under 0.25.
+    //
+    // Through a dark or blurred stretch every landmark is visible and none is
+    // matched, so that ratio collapses -- and the landmarks best placed to
+    // bridge the gap (born a keyframe or two before it) are exactly the ones
+    // the culler destroys on the way through. That charges the landmark for the
+    // camera's failure.
+    //
+    // When the whole frame matched almost nothing, the frame was blind: refund
+    // the visibility ticks so the landmarks survive to be re-found on the far
+    // side. Nothing is credited -- mnFound is untouched -- so a landmark that
+    // really has gone still dies, just not during a blackout.
+    if(mnMatchesInliers < mnBlindInliers && !mvpChargedVisible.empty())
+    {
+        for(MapPoint* pMP : mvpChargedVisible)
+            if(pMP && !pMP->isBad())
+                pMP->DecreaseVisible();
+        mnBlindFrames++;
+        if(mnBlindFrames % 20 == 1)
+            std::cout << "[Debug] blind frame (" << mnMatchesInliers
+                      << " inliers): refunded " << mvpChargedVisible.size()
+                      << " visibility ticks so bridging landmarks survive"
+                      << std::endl;
+    }
+
     // Decide if the tracking was succesful
     // More restrictive if there was a relocalization recently
     mpLocalMapper->mnMatchesInliers=mnMatchesInliers;
@@ -3645,6 +3933,9 @@ void Tracking::CreateNewKeyFrame()
 
 void Tracking::SearchLocalPoints()
 {
+    mvpChargedVisible.clear();
+    mvpChargedVisible.reserve(2048);
+
     // Do not search map points already matched
     for(vector<MapPoint*>::iterator vit=mCurrentFrame.mvpMapPoints.begin(), vend=mCurrentFrame.mvpMapPoints.end(); vit!=vend; vit++)
     {
@@ -3658,6 +3949,7 @@ void Tracking::SearchLocalPoints()
             else
             {
                 pMP->IncreaseVisible();
+                mvpChargedVisible.push_back(pMP);
                 pMP->mnLastFrameSeen = mCurrentFrame.mnId;
                 pMP->mbTrackInView = false;
                 pMP->mbTrackInViewR = false;
@@ -3680,6 +3972,7 @@ void Tracking::SearchLocalPoints()
         if(mCurrentFrame.isInFrustum(pMP,0.5))
         {
             pMP->IncreaseVisible();
+            mvpChargedVisible.push_back(pMP);
             nToMatch++;
         }
         if(pMP->mbTrackInView)

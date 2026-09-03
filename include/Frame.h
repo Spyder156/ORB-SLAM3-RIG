@@ -28,6 +28,7 @@
 #include "Thirdparty/Sophus/sophus/geometry.hpp"
 
 #include "ImuTypes.h"
+#include "LineExtractor.h"
 #include "ORBVocabulary.h"
 
 #include "Converter.h"
@@ -226,6 +227,13 @@ public:
     // In the stereo case, mvKeysUn is redundant as images must be rectified.
     // In the RGB-D case, RGB images can be distorted.
     std::vector<cv::KeyPoint> mvKeys, mvKeysRight;
+
+    // Spherical line features. Camera index lives INSIDE LineObs (0 front,
+    // 1 rear), so lines from the two lenses can share one container the way
+    // points do via Nleft -- and a line is never matched across cameras.
+    std::vector<LineObs> mvLines;
+    std::vector<class MapLine*> mvpMapLines;
+    std::vector<bool> mvbLineOutlier;
     std::vector<cv::KeyPoint> mvKeysUn;
 
     // Corresponding stereo coordinate and depth for each keypoint.
