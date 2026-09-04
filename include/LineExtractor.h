@@ -26,6 +26,14 @@ namespace ORB_SLAM3 {
 
 /// One observed line segment in a frame.
 struct LineObs {
+    /// LBD appearance descriptor (Zhang & Koser 2013): 9 bands parallel to the
+    /// segment x (mean,std) of 4 oriented-gradient channels = 72 dims,
+    /// L2-normalised. Geometry says WHERE a line is; this says what it LOOKS
+    /// like -- the matcher needs both, exactly as ORB corners carry BRIEF.
+    /// plain array, NOT an Eigen fixed-size type: those demand 16-byte
+    /// alignment that std::vector storage does not guarantee (=> segfault)
+    float lbd[72] = {0};
+    bool hasLbd = false;
     cv::Point2f p1, p2;        ///< pixel endpoints (as detected)
     Eigen::Vector3f b1u, b2u;  ///< UNIT bearings of the endpoints (camera frame)
     Eigen::Vector3f n;         ///< unit normal of the great circle, b1 x b2
@@ -62,6 +70,9 @@ public:
     /// reports "no motion" while the rig moves.
     void SetMask(int camIdx, const cv::Mat& mask);
     cv::Mat mMask[2];
+
+    /// Compute LBD descriptors for a set of observations on their image.
+    void ComputeLBD(const cv::Mat& imGray, std::vector<LineObs>& obs) const;
 
     /// Match `cur` against `prev` with the winner's three gates:
     /// normal alignment, in-plane direction, angular-length consistency.
