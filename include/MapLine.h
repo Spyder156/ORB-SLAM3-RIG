@@ -132,6 +132,27 @@ public:
                                const Eigen::Vector3f& b1, const Eigen::Vector3f& b2,
                                float maxDepth = 100.f);
 
+    /// Along-line interval [t0,t1] (parameter along mDir from the point d x m)
+    /// that an observation's endpoint bearings cut out of this line. False if
+    /// either bearing is near-parallel to the line or intersects behind.
+    bool ObservedInterval(const Eigen::Matrix3f& Rcw, const Eigen::Vector3f& tcw,
+                          const Eigen::Vector3f& b1, const Eigen::Vector3f& b2,
+                          float& t0, float& t1);
+
+    /// Do two observations of a candidate line (d_w,m_w) see OVERLAPPING
+    /// pieces of it? This is the correspondence check the aperture-blind
+    /// residual cannot do -- and unlike the old chord-direction gate it is
+    /// geometrically valid everywhere on the great circle. (The chord equals
+    /// the tangent at the segment MIDPOINT: chord angle to d = midpoint arc
+    /// offset from the foot point, so gating it rejected every correctly
+    /// triangulated off-centre segment.)
+    static bool IntervalsOverlap(const Eigen::Vector3f& d_w, const Eigen::Vector3f& m_w,
+                                 const Eigen::Matrix3f& R1, const Eigen::Vector3f& t1,
+                                 const Eigen::Vector3f& b11, const Eigen::Vector3f& b12,
+                                 const Eigen::Matrix3f& R2, const Eigen::Vector3f& t2,
+                                 const Eigen::Vector3f& b21, const Eigen::Vector3f& b22,
+                                 float slack = 0.3f);
+
 protected:
     Eigen::Vector3f mDir;      ///< unit direction
     Eigen::Vector3f mMom;      ///< moment, orthogonal to mDir

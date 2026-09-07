@@ -88,6 +88,47 @@ void MapLine::UnionExtent(const Eigen::Vector3f& e1, const Eigen::Vector3f& e2) 
     mEnd2 = p0 + tmax * mDir;
 }
 
+static bool intervalOf(const Eigen::Vector3f& d_w, const Eigen::Vector3f& m_w,
+                       const Eigen::Matrix3f& Rcw, const Eigen::Vector3f& tcw,
+                       const Eigen::Vector3f& b1, const Eigen::Vector3f& b2,
+                       float& t0, float& t1) {
+    const Eigen::Vector3f d_c = Rcw * d_w;
+    const Eigen::Vector3f m_c = Rcw * m_w + tcw.cross(d_c);
+    const Eigen::Vector3f p0w = d_w.cross(m_w);          // point on line nearest origin
+    float tt[2]; int k = 0;
+    for (const Eigen::Vector3f* b : {&b1, &b2}) {
+        const Eigen::Vector3f cr = b->cross(d_c);
+        const float den = cr.squaredNorm();
+        if (den < 0.0194f) return false;                 // >= sin(8 deg), as extent
+        const float s = m_c.dot(cr) / den;
+        if (!std::isfinite(s) || s <= 0.05f || s > 500.f) return false;
+        const Eigen::Vector3f Xw = Rcw.transpose() * (s * (*b) - tcw);
+        tt[k++] = (Xw - p0w).dot(d_w);
+    }
+    t0 = std::min(tt[0], tt[1]); t1 = std::max(tt[0], tt[1]);
+    return true;
+}
+
+bool MapLine::ObservedInterval(const Eigen::Matrix3f& Rcw, const Eigen::Vector3f& tcw,
+                               const Eigen::Vector3f& b1, const Eigen::Vector3f& b2,
+                               float& t0, float& t1) {
+    Eigen::Vector3f d_w, m_w;
+    { std::unique_lock<std::mutex> lk(mMutexPos); d_w = mDir; m_w = mMom; }
+    return intervalOf(d_w, m_w, Rcw, tcw, b1, b2, t0, t1);
+}
+
+bool MapLine::IntervalsOverlap(const Eigen::Vector3f& d_w, const Eigen::Vector3f& m_w,
+                               const Eigen::Matrix3f& R1, const Eigen::Vector3f& t1,
+                               const Eigen::Vector3f& b11, const Eigen::Vector3f& b12,
+                               const Eigen::Matrix3f& R2, const Eigen::Vector3f& t2,
+                               const Eigen::Vector3f& b21, const Eigen::Vector3f& b22,
+                               float slack) {
+    float a0, a1, c0, c1;
+    if (!intervalOf(d_w, m_w, R1, t1, b11, b12, a0, a1)) return false;
+    if (!intervalOf(d_w, m_w, R2, t2, b21, b22, c0, c1)) return false;
+    return (std::min(a1, c1) - std::max(a0, c0)) > -slack;
+}
+
 bool MapLine::SetExtentFromBearings(const Eigen::Matrix3f& Rcw,
                                     const Eigen::Vector3f& tcw,
                                     const Eigen::Vector3f& b1,
