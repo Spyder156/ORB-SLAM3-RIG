@@ -146,7 +146,9 @@ void LineExtractor::ComputeLBD(const cv::Mat& img, std::vector<LineObs>& obs) co
 }
 
 std::vector<int> LineExtractor::Match(const std::vector<LineObs>& cur,
-                                      const std::vector<LineObs>& prev) const {
+                                      const std::vector<LineObs>& prev,
+                                      const Eigen::Matrix3f& Rpred0,
+                                      const Eigen::Matrix3f& Rpred1) const {
     std::vector<int> assign(cur.size(), -1);
     if (prev.empty() || cur.empty()) return assign;
 
@@ -160,10 +162,14 @@ std::vector<int> LineExtractor::Match(const std::vector<LineObs>& cur,
     for (size_t i = 0; i < cur.size(); ++i) {
         for (size_t j = 0; j < prev.size(); ++j) {
             if (cur[i].cam != prev[j].cam) continue;      // never mix cameras
-            // sign-free: a line has no orientation, so |n_i . n_j|
-            const float an = std::fabs(cur[i].n.dot(prev[j].n));
+            const Eigen::Matrix3f& Rp = prev[j].cam == 0 ? Rpred0 : Rpred1;
+            // rotate the PREVIOUS observation into the current camera first,
+            // so the gates measure line identity, not head rotation
+            const Eigen::Vector3f npj = Rp * prev[j].n;
+            const Eigen::Vector3f dpj = Rp * prev[j].dir;
+            const float an = std::fabs(cur[i].n.dot(npj));
             if (an < cN) continue;
-            const float ad = std::fabs(cur[i].dir.dot(prev[j].dir));
+            const float ad = std::fabs(cur[i].dir.dot(dpj));
             if (ad < cD) continue;
             const float lo = std::min(cur[i].angLen, prev[j].angLen);
             const float hi = std::max(cur[i].angLen, prev[j].angLen);
@@ -178,8 +184,15 @@ std::vector<int> LineExtractor::Match(const std::vector<LineObs>& cur,
                     dd += e * e;
                 }
                 dd = std::sqrt(dd);
-                if (dd > 0.55f) continue;
-                cands.push_back({2.f - dd, int(i), int(j)});   // best appearance first
+                // LBD is a VETO, never a judge. Appearance-first ranking
+                // promoted lookalikes over the geometrically closest match,
+                // and a lookalike error RECURS every frame: it graduates
+                // probation and becomes a confident wrong landmark (per-pair
+                // consistency rose while full-run score fell 84 -> 0.3).
+                // Geometry keeps the ranking -- the 33 ms motion prior is the
+                // strongest signal at 30 fps; appearance only kills impostors.
+                if (dd > 0.85f) continue;    // appearance contradicts
+                cands.push_back({an, int(i), int(j)});
             } else
                 cands.push_back({an, int(i), int(j)});
         }

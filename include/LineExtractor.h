@@ -48,6 +48,9 @@ struct LineObs {
     // gives the two interpretation planes enough angle to intersect.
     bool hasAnchor = false;
     int anchorMapVersion = -1;   ///< Map::GetMapChangeIndex() when anchored
+    Eigen::Vector3f anchorB1 = Eigen::Vector3f::Zero();  ///< anchor endpoint bearings,
+    Eigen::Vector3f anchorB2 = Eigen::Vector3f::Zero();  ///< for the extent-overlap test
+    float anchorLpx = 0.f;                                ///< anchor segment pixel length
     Eigen::Vector3f nAnchor = Eigen::Vector3f::Zero();
     Eigen::Matrix3f RAnchor = Eigen::Matrix3f::Identity();
     Eigen::Vector3f tAnchor = Eigen::Vector3f::Zero();
@@ -78,8 +81,14 @@ public:
     /// normal alignment, in-plane direction, angular-length consistency.
     /// Comparisons are sign-free -- a line has no orientation.
     /// Returns cur-index -> prev-index, or -1.
+    /// Rpred0/1: predicted rotation prev-cam -> cur-cam per lens (from gyro
+    /// preintegration). Compensating real rotation BEFORE gating is what lets
+    /// a 3 deg gate mean "same line" instead of "same line AND slow head":
+    /// measured uncompensated, match rate fell 76% -> 55% by 1.5-3 rad/s.
     std::vector<int> Match(const std::vector<LineObs>& cur,
-                           const std::vector<LineObs>& prev) const;
+                           const std::vector<LineObs>& prev,
+                           const Eigen::Matrix3f& Rpred0 = Eigen::Matrix3f::Identity(),
+                           const Eigen::Matrix3f& Rpred1 = Eigen::Matrix3f::Identity()) const;
 
     float mMinAngLen, mMaxAngLen;   ///< [rad]
     float mGateNormal, mGateDir;    ///< [rad]
