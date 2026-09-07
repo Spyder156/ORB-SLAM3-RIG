@@ -297,6 +297,12 @@ protected:
     /// visibility ticks charged this frame are refunded so MapPointCulling()
     /// does not destroy the landmarks that would bridge the gap.
     int mnBlindInliers = 20;
+    bool mbUseLBD = false;
+    /// landmark re-acquisition pool: lines seen recently, with last-seen frame
+    std::map<MapLine*, long> mRecentLines;
+    long mnReacq = 0;
+    Eigen::Vector3f mPredTwb = Eigen::Vector3f::Zero();  ///< IMU-predicted position
+    bool mbPredValid = false;
     long mnBlindFrames = 0;
     std::vector<MapPoint*> mvpChargedVisible;
     std::vector<int> mvLineAssign;   ///< cur->prev line match, computed pre-Track()
