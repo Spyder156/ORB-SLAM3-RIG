@@ -43,6 +43,10 @@ void LoadIMU(const string &strImuPath, vector<double> &vTimeStamps, vector<cv::P
 double ttrack_tot = 0;
 int main(int argc, char *argv[])
 {
+    // LOCKSTEP=1: drain LocalMapping after every frame -- removes the
+    // thread-interleaving lottery in keyframe insertion. Offline-legit.
+    const bool bLockstep = getenv("LOCKSTEP") && atoi(getenv("LOCKSTEP")) != 0;
+    if(bLockstep) cout << "[Debug] LOCKSTEP mode on" << endl;
 
     if(argc < 5)
     {
@@ -231,6 +235,8 @@ int main(int argc, char *argv[])
             // Pass the image to the SLAM system
             // cout << "tframe = " << tframe << endl;
             SLAM.TrackMonoRig(im,imRight,tframe,vImuMeas);
+            if(bLockstep)
+                while(SLAM.MappingQueueSize() > 0) usleep(500);
             SLAM.DumpFrameKeypoints();
 
     #ifdef COMPILEDWITHC11

@@ -833,6 +833,11 @@ void System::SaveMapPoints(const string &filename)
     cout << "  wrote " << n << " map points (" << nbad << " bad/culled skipped)" << endl;
 }
 
+int System::MappingQueueSize()
+{
+    return mpLocalMapper->KeyframesInQueue();
+}
+
 void System::SaveMapLines(const string &filename)
 {
     cout << endl << "Saving map lines to " << filename << " ..." << endl;

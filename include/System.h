@@ -175,6 +175,9 @@ public:
     /// frame as SaveMapPoints and SaveTrajectoryEuRoC.
     void SaveMapLines(const string &filename);
 
+    /// Keyframes still queued in LocalMapping (lockstep support).
+    int MappingQueueSize();
+
     /// Per-frame keypoint dump for the run-output contract (SLAM/docs/OUTPUT.md).
     /// Without this the rerun has no feature overlay and a front-end failure is
     /// undiagnosable -- which is exactly the position we were in on the door
