@@ -1743,8 +1743,6 @@ Sophus::SE3f Tracking::GrabImageMonoRig(const cv::Mat &im0, const cv::Mat &im1,
     if(mbUseLines && mpLineExtractor){
         std::vector<LineObs> l0 = mpLineExtractor->Extract(mImGray, mpCamera, 0);
         std::vector<LineObs> l1 = mpLineExtractor->Extract(imGrayRight, mpCamera2, 1);
-        mpLineExtractor->ComputeLBD(mImGray, l0);
-        mpLineExtractor->ComputeLBD(imGrayRight, l1);
         mCurrentFrame.mvLines = l0;
         mCurrentFrame.mvLines.insert(mCurrentFrame.mvLines.end(), l1.begin(), l1.end());
         mCurrentFrame.mvpMapLines.assign(mCurrentFrame.mvLines.size(), nullptr);

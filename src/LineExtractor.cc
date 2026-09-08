@@ -86,65 +86,6 @@ std::vector<LineObs> LineExtractor::Extract(const cv::Mat& imGray,
     return out;
 }
 
-void LineExtractor::ComputeLBD(const cv::Mat& img, std::vector<LineObs>& obs) const {
-    // gradients once per frame
-    cv::Mat gx, gy;
-    cv::Sobel(img, gx, CV_32F, 1, 0, 3);
-    cv::Sobel(img, gy, CV_32F, 0, 1, 3);
-    const int NB = 9, BW = 7;               // 9 bands x 7 px across the line
-    const int ROWS = NB * BW;
-    // Gaussian across the band, as in the paper: strips near the line dominate
-    std::vector<float> wg(ROWS);
-    for (int r = 0; r < ROWS; r++) {
-        const float off = r - (ROWS - 1) / 2.f;
-        const float sg = 0.5f * ROWS / 2.f;
-        wg[r] = std::exp(-off * off / (2.f * sg * sg));
-    }
-    for (auto& lo : obs) {
-        const float dx = lo.p2.x - lo.p1.x, dy = lo.p2.y - lo.p1.y;
-        const float L = std::sqrt(dx * dx + dy * dy);
-        if (L < 2.f) { lo.hasLbd = false; continue; }
-        const float ux = dx / L, uy = dy / L;      // along
-        const float vx = -uy, vy = ux;             // across
-        const int NA = std::max(5, std::min(40, (int)L));
-        float d[72] = {0};
-        for (int b = 0; b < NB; b++) {
-            float m[4] = {0,0,0,0}, m2[4] = {0,0,0,0};
-            int cnt = 0;
-            for (int r = b * BW; r < (b + 1) * BW; r++) {
-                const float off = r - (ROWS - 1) / 2.f;
-                for (int a = 0; a < NA; a++) {
-                    const float t = NA == 1 ? 0.f : (float)a / (NA - 1);
-                    const int x = (int)std::lround(lo.p1.x + t * dx + off * vx);
-                    const int y = (int)std::lround(lo.p1.y + t * dy + off * vy);
-                    if (x < 0 || y < 0 || x >= img.cols || y >= img.rows) continue;
-                    const float GX = gx.at<float>(y, x), GY = gy.at<float>(y, x);
-                    const float dL = (GX * ux + GY * uy) * wg[r];
-                    const float dO = (GX * vx + GY * vy) * wg[r];
-                    const float f[4] = {std::max(dL, 0.f), std::max(-dL, 0.f),
-                                        std::max(dO, 0.f), std::max(-dO, 0.f)};
-                    for (int c = 0; c < 4; c++) { m[c] += f[c]; m2[c] += f[c] * f[c]; }
-                    cnt++;
-                }
-            }
-            if (cnt < 4) continue;
-            for (int c = 0; c < 4; c++) {
-                const float mu = m[c] / cnt;
-                d[b * 8 + c] = mu;
-                d[b * 8 + 4 + c] = std::sqrt(std::max(0.f, m2[c] / cnt - mu * mu));
-            }
-        }
-        float n = 0; for (int i = 0; i < 72; i++) n += d[i] * d[i];
-        n = std::sqrt(n);
-        if (n < 1e-9f) { lo.hasLbd = false; continue; }
-        for (int i = 0; i < 72; i++) d[i] = std::min(d[i] / n, 0.2f);  // SIFT clamp
-        n = 0; for (int i = 0; i < 72; i++) n += d[i] * d[i];
-        n = std::sqrt(n);
-        for (int i = 0; i < 72; i++) lo.lbd[i] = d[i] / n;
-        lo.hasLbd = true;
-    }
-}
-
 std::vector<int> LineExtractor::Match(const std::vector<LineObs>& cur,
                                       const std::vector<LineObs>& prev) const {
     std::vector<int> assign(cur.size(), -1);
@@ -168,20 +109,7 @@ std::vector<int> LineExtractor::Match(const std::vector<LineObs>& cur,
             const float lo = std::min(cur[i].angLen, prev[j].angLen);
             const float hi = std::max(cur[i].angLen, prev[j].angLen);
             if (hi < 1e-9f || lo / hi < mGateLenRatio) continue;
-            // LBD appearance gate + ranking. Geometry alone cannot tell one
-            // door-frame edge from its parallel neighbour; the descriptor can.
-            // Offline on this dataset: bad matches -47%, good kept 92%.
-            if (cur[i].hasLbd && prev[j].hasLbd) {
-                float dd = 0;
-                for (int q = 0; q < 72; q++) {
-                    const float e = cur[i].lbd[q] - prev[j].lbd[q];
-                    dd += e * e;
-                }
-                dd = std::sqrt(dd);
-                if (dd > 0.55f) continue;
-                cands.push_back({2.f - dd, int(i), int(j)});   // best appearance first
-            } else
-                cands.push_back({an, int(i), int(j)});
+            cands.push_back({an, int(i), int(j)});
         }
     }
     std::sort(cands.begin(), cands.end(),
