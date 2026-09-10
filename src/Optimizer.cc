@@ -2837,6 +2837,102 @@ void Optimizer::LocalInertialBA(KeyFrame *pKF, bool *pbStopFlag, Map *pMap, int&
         }
     }
 
+    // ---- MapLine vertices: the points-parity block. Every line observed by
+    // the window enters BA as a 4-DoF orthonormal vertex with one plane edge
+    // per observing keyframe -- refined by ALL its observations, not just the
+    // 2 planes that triangulated it.
+    // Line vertex ids live above the point id range (point ids are
+    // pMP->mnId + iniMPid + 1 with pMP->mnId < MapPoint::nNextId).
+    const unsigned long iniMLid = iniMPid + MapPoint::nNextId + 2;
+    // Observations required before BA may treat a line as an UNKNOWN. The
+    // vertex is 6 DoF with 2 of them gauge (sliding along the line, which no
+    // observation can see), so 4 are observable and each observation gives 2
+    // rows -> 2 would just determine it; require 3 for margin. LM damping
+    // handles the gauge directions, exactly as PLVS/ORB-LINE-SLAM do.
+    const size_t LINE_BA_MIN_OBS = 4;   // 3-obs lines measured unstable (43-137 cm/call)
+
+    list<MapLine*> lLocalMapLines;
+    for(int i=0; i<N; i++)
+    {
+        KeyFrame* pKFi = vpOptimizableKFs[i];
+        for(MapLine* pML : pKFi->mvpMapLines)
+        {
+            if(!pML || pML->isBad() || pML->mnValidated < 2) continue;
+            if(pML->mnBALocalForKF == pKF->mnId) continue;
+            pML->mnBALocalForKF = pKF->mnId;
+            lLocalMapLines.push_back(pML);
+        }
+    }
+
+    vector<EdgeLine*> vpEdgesLine;
+    vector<KeyFrame*> vpEdgeKFLine;
+    vector<MapLine*> vpMapLineEdge;
+    vector<int> vpEdgeIdxLine;          // observation index within that KF
+    list<MapLine*> lLinesInGraph;
+
+    const float chi2Line2 = 5.991;
+    for(list<MapLine*>::iterator lit=lLocalMapLines.begin(), lend=lLocalMapLines.end(); lit!=lend; lit++)
+    {
+        MapLine* pML = *lit;
+        const map<KeyFrame*,int> obs = pML->GetObservations();
+
+        // Only keyframes already in the graph constrain the line (we do not
+        // enlarge the fixed set for lines); a 4-DoF vertex needs >= 2 edges
+        // (4 rows) to be determined, else it is left out untouched.
+        vector<pair<KeyFrame*,int>> vUsable;
+        for(map<KeyFrame*,int>::const_iterator mit=obs.begin(), mend=obs.end(); mit!=mend; mit++)
+        {
+            KeyFrame* pKFi = mit->first;
+            if(pKFi->mnBALocalForKF!=pKF->mnId && pKFi->mnBAFixedForKF!=pKF->mnId) continue;
+            if(pKFi->isBad() || pKFi->GetMap() != pCurrentMap) continue;
+            if(mit->second < 0 || mit->second >= (int)pKFi->mvLines.size()) continue;
+            vUsable.push_back(make_pair(pKFi, mit->second));
+        }
+        if(vUsable.size() < 2) continue;
+
+        // A 3D line has 4 DoF. Each observation contributes ~ONE independent
+        // row: its two endpoint residuals both test the same interpretation
+        // plane, and on a short segment b1 ~ b2 makes them near-identical.
+        // So a 2-observation line is UNDERDETERMINED and the optimizer slides
+        // it along the null space -- measured at 60-103 cm per BA call, every
+        // call, never converging (6+ observation lines move 4-18 cm).
+        // Below the determinacy bar the landmark stays FIXED: its edges still
+        // constrain the POSE exactly as before, but BA may not invent its
+        // geometry. This is what MapPointCulling's 3-observation rule does
+        // for points, stated in the form a line needs.
+        const bool bDetermined = vUsable.size() >= LINE_BA_MIN_OBS;
+
+        Eigen::Vector3f vS, vE; pML->GetEndpoints(vS, vE);
+        VertexLine* vLine = new VertexLine(vS, vE);
+        vLine->setId(pML->mnId + iniMLid + 1);
+        vLine->setFixed(!bDetermined);
+        vLine->setMarginalized(bDetermined);
+        optimizer.addVertex(vLine);
+        if(bDetermined) lLinesInGraph.push_back(pML);
+
+        for(size_t k=0; k<vUsable.size(); k++)
+        {
+            KeyFrame* pKFi = vUsable[k].first;
+            const LineObs &lo = pKFi->mvLines[vUsable[k].second];
+
+            const float f0 = pKFi->mpCamera ? pKFi->mpCamera->getParameter(0) : 400.f;
+            EdgeLine* el = new EdgeLine(lo.n, f0, lo.cam);
+            el->setVertex(0, dynamic_cast<g2o::OptimizableGraph::Vertex*>(vLine));
+            el->setVertex(1, dynamic_cast<g2o::OptimizableGraph::Vertex*>(optimizer.vertex(pKFi->mnId)));
+            el->setMeasurement(Eigen::Vector3d::Zero());
+            // residual is in PIXELS now: sigma = 3 px, same numbers as points
+            el->setInformation(Eigen::Matrix2d::Identity() / 9.0);
+            g2o::RobustKernelHuber* rkl = new g2o::RobustKernelHuber;
+            el->setRobustKernel(rkl);
+            rkl->setDelta(sqrt(chi2Line2));
+            optimizer.addEdge(el);
+            vpEdgesLine.push_back(el);
+            vpEdgeKFLine.push_back(pKFi);
+            vpMapLineEdge.push_back(pML);
+            vpEdgeIdxLine.push_back(vUsable[k].second);
+        }
+    }
+
     //cout << "Total map points: " << lLocalMapPoints.size() << endl;
     for(map<int,int>::iterator mit=mVisEdges.begin(), mend=mVisEdges.end(); mit!=mend; mit++)
     {
@@ -2889,6 +2985,20 @@ void Optimizer::LocalInertialBA(KeyFrame *pKF, bool *pbStopFlag, Map *pMap, int&
         }
     }
 
+    // Lines: same inlier discipline as points -- chi2 gate plus the
+    // mirror-solution (cheirality) guard.
+    vector<pair<KeyFrame*,MapLine*> > vToEraseLine;
+    vToEraseLine.reserve(vpEdgesLine.size());
+    for(size_t i=0, iend=vpEdgesLine.size(); i<iend;i++)
+    {
+        EdgeLine* el = vpEdgesLine[i];
+        MapLine* pML = vpMapLineEdge[i];
+        if(pML->isBad())
+            continue;
+        if(el->chi2()>chi2Line2 || !el->isDepthPositive())
+            vToEraseLine.push_back(make_pair(vpEdgeKFLine[i],pML));
+    }
+
     // Get Map Mutex and erase outliers
     unique_lock<mutex> lock(pMap->mMutexMapUpdate);
 
@@ -2912,6 +3022,18 @@ void Optimizer::LocalInertialBA(KeyFrame *pKF, bool *pbStopFlag, Map *pMap, int&
             pMPi->EraseObservation(pKFi);
         }
     }
+
+    for(size_t i=0;i<vToEraseLine.size();i++)
+    {
+        KeyFrame* pKFi = vToEraseLine[i].first;
+        MapLine* pMLi = vToEraseLine[i].second;
+        pKFi->EraseMapLineMatch(pMLi);
+        pMLi->EraseObservation(pKFi);
+    }
+
+    std::cout << "[AUDIT] LBA lines: " << lLinesInGraph.size() << " vertices / "
+              << vpEdgesLine.size() << " edges in graph, "
+              << vToEraseLine.size() << " obs erased as outliers\n";
 
     for(list<KeyFrame*>::iterator lit=lFixedKeyFrames.begin(), lend=lFixedKeyFrames.end(); lit!=lend; lit++)
         (*lit)->mnBAFixedForKF = 0;
@@ -2958,6 +3080,113 @@ void Optimizer::LocalInertialBA(KeyFrame *pKF, bool *pbStopFlag, Map *pMap, int&
         g2o::VertexSBAPointXYZ* vPoint = static_cast<g2o::VertexSBAPointXYZ*>(optimizer.vertex(pMP->mnId+iniMPid+1));
         pMP->SetWorldPos(vPoint->estimate().cast<float>());
         pMP->UpdateNormalAndDepth();
+    }
+
+    //Lines: write the refined Plucker back (SetPlucker re-normalises d and
+    //re-orthogonalises m against d, and slides the extent onto the new line).
+    // Shift bucketed by how many observations constrained the line. A 4-DoF
+    // line needs >= 4 independent rows; each edge contributes ~1 (its two
+    // endpoint rows are nearly the same constraint on a short segment), so
+    // 2-observation lines are UNDERDETERMINED and BA slides them freely.
+    std::map<MapLine*,int> nEdgeOf;
+    for(size_t i2=0;i2<vpMapLineEdge.size();i2++) nEdgeOf[vpMapLineEdge[i2]]++;
+    double bMove[4] = {0,0,0,0}; int bN[4] = {0,0,0,0};
+    double dMove = 0.0, dRot = 0.0; int nMoved = 0;
+    for(list<MapLine*>::iterator lit=lLinesInGraph.begin(), lend=lLinesInGraph.end(); lit!=lend; lit++)
+    {
+        MapLine* pML = *lit;
+        VertexLine* vLine = static_cast<VertexLine*>(optimizer.vertex(pML->mnId + iniMLid + 1));
+        if(!vLine) continue;
+        const Eigen::Vector3d S = vLine->estimate().head<3>();
+        const Eigen::Vector3d E = vLine->estimate().tail<3>();
+        if(!S.allFinite() || !E.allFinite()) continue;
+        {   // WHAT BA DID TO THIS LANDMARK: before/after endpoints, so the
+            // collapse (both endpoints sliding onto each other -- pure gauge,
+            // invisible to the residual) can be SEEN rather than inferred.
+            static long nba = 0; static std::ofstream bf;
+            if(!bf.is_open()){ bf.open("ba_line_motion.csv");
+                bf << "ba,id,nobs,sx0,sy0,sz0,ex0,ey0,ez0,sx1,sy1,sz1,ex1,ey1,ez1\n"; }
+            Eigen::Vector3f B1,B2; pML->GetEndpoints(B1,B2);
+            if(nba < 400000)
+                bf << nba << "," << pML->mnId << "," << nEdgeOf[pML] << ","
+                   << B1(0)<<","<<B1(1)<<","<<B1(2)<<","
+                   << B2(0)<<","<<B2(1)<<","<<B2(2)<<","
+                   << S(0)<<","<<S(1)<<","<<S(2)<<","
+                   << E(0)<<","<<E(1)<<","<<E(2)<<"\n";
+            nba++;
+        }
+        // ---- GUARD + RE-CLIP -------------------------------------------
+        // The 2 DoF of sliding an endpoint ALONG the line are GAUGE: the
+        // residual cannot see them, so LM slides both endpoints together and
+        // the segment collapses to a point (measured: most landmarks, worse
+        // with MORE observations). PLVS blocks this with a 3D endpoint term
+        // that needs depth; monocular has no depth, so instead:
+        //   1. refuse a collapsed / exploded update,
+        //   2. take only the LINE from BA and RE-DERIVE the endpoints by
+        //      intersecting the observed bearings with it (union over the
+        //      observing keyframes). The endpoints stop being free at all.
+        const double lenNew = (E - S).norm();
+        if(!(lenNew > 0.02 && lenNew < 10.0)) continue;  // keep the pre-BA extent
+        // how far did BA actually move this landmark? midpoint shift +
+        // direction change. Zero here means the vertex never budged.
+        Eigen::Vector3f S0, E0; pML->GetEndpoints(S0, E0);
+        const Eigen::Vector3f d0 = pML->GetDirection();
+        // GAUGE-INVARIANT motion: perpendicular distance between the old and
+        // new INFINITE lines. Sliding the endpoints along the line is gauge
+        // (unobservable) and must not be counted as the landmark moving.
+        const Eigen::Vector3d dn_ = (E - S).normalized();
+        const Eigen::Vector3d w_  = 0.5*(S+E) - 0.5*(S0+E0).cast<double>();
+        const double sh = (w_ - dn_*(w_.dot(dn_))).norm();
+        const Eigen::Vector3d dn = (E - S).normalized();
+        dMove += sh;
+        dRot  += std::acos(std::min(1.0, std::fabs(dn.dot(d0.cast<double>()))));
+        nMoved++;
+        const int ne = nEdgeOf[pML];
+        const int bk = ne <= 2 ? 0 : (ne <= 3 ? 1 : (ne <= 5 ? 2 : 3));
+        bMove[bk] += sh; bN[bk]++;
+        pML->SetEndpoints(S.cast<float>(), E.cast<float>());
+        {   // RE-DERIVE the extent from the observations (kills the gauge)
+            const Eigen::Vector3f dW = pML->GetDirection();
+            const Eigen::Vector3f p0 = dW.cross(pML->GetMoment());
+            float umin = 1e9f, umax = -1e9f; int nUsed = 0;
+            for(size_t q = 0; q < vpMapLineEdge.size(); q++)
+            {
+                if(vpMapLineEdge[q] != pML) continue;
+                KeyFrame* pKq = vpEdgeKFLine[q];
+                const int iq = vpEdgeIdxLine[q];
+                if(!pKq || pKq->isBad() || iq < 0 || iq >= (int)pKq->mvLines.size()) continue;
+                const LineObs &lq = pKq->mvLines[iq];
+                Sophus::SE3f Tq = pKq->GetPose();
+                if(lq.cam == 1 && pKq->mpCamera2) Tq = pKq->GetRelativePoseTrl() * Tq;
+                const Eigen::Matrix3f Rq = Tq.rotationMatrix();
+                const Eigen::Vector3f tq = Tq.translation();
+                const Eigen::Vector3f dC = Rq * dW;
+                const Eigen::Vector3f mC = Rq * pML->GetMoment() + tq.cross(dC);
+                for(const Eigen::Vector3f& b : {lq.b1u, lq.b2u}){
+                    const Eigen::Vector3f cr = b.cross(dC);
+                    const float den = cr.squaredNorm();
+                    if(den < 1e-10f) continue;
+                    const float sdep = mC.dot(cr) / den;
+                    if(!(sdep > 0.05f && sdep < 40.f)) continue;
+                    const Eigen::Vector3f xw = Rq.transpose() * (sdep * b - tq);
+                    const float u = (xw - p0).dot(dW);
+                    umin = std::min(umin, u); umax = std::max(umax, u);
+                    nUsed++;
+                }
+            }
+            if(nUsed >= 2 && umax - umin > 0.02f && umax - umin < 20.f)
+                pML->SetEndpoints(p0 + dW * umin, p0 + dW * umax);
+        }
+    }
+    if(nMoved){
+        std::cout << "[AUDIT] LBA line motion: " << nMoved << " lines, mean shift "
+                  << 100.0*dMove/nMoved << " cm, mean rotation "
+                  << 180.0/M_PI*dRot/nMoved << " deg | by #obs: ";
+        const char* lbl[4] = {"2obs","3obs","4-5obs","6+obs"};
+        for(int k2=0;k2<4;k2++)
+            std::cout << lbl[k2] << " n=" << bN[k2] << " "
+                      << (bN[k2] ? 100.0*bMove[k2]/bN[k2] : 0.0) << "cm  ";
+        std::cout << std::endl;
     }
 
     pMap->IncreaseChangeIndex();
@@ -4665,15 +4894,15 @@ int Optimizer::PoseInertialOptimizationLastKeyFrame(Frame *pFrame, bool bRecInit
     if(!pFrame->mvLines.empty() && !pFrame->mvpMapLines.empty())
     {
         const float f0 = pFrame->mpCamera ? pFrame->mpCamera->getParameter(0) : 400.f;
-        const double infoLineK = double(f0) * double(f0) / 9.0;   // sigma = 3 px
+        const double infoLineK = 1.0 / 9.0;   // sigma = 3 px (residual is in PIXELS)
         for(size_t i = 0; i < pFrame->mvLines.size() && i < pFrame->mvpMapLines.size(); i++)
         {
             MapLine* pML = pFrame->mvpMapLines[i];
             if(!pML || pML->isBad() || pML->mnValidated < 2) continue;
             const LineObs &lo = pFrame->mvLines[i];
+            Eigen::Vector3f eS, eE; pML->GetEndpoints(eS, eE);
             EdgeLineOnlyPose* el = new EdgeLineOnlyPose(
-                pML->GetDirection(), pML->GetMoment(), lo.b1u, lo.b2u, lo.cam,
-                pML->mCreateParallax);
+                eS, eE, lo.n, f0, lo.cam, pML->mCreateParallax);
             el->setVertex(0, VP);
             el->setMeasurement(Eigen::Vector2d::Zero());
             el->setInformation(Eigen::Matrix2d::Identity() * infoLineK);
@@ -5108,16 +5337,16 @@ int Optimizer::PoseInertialOptimizationLastFrame(Frame *pFrame, bool bRecInit)
     if(!pFrame->mvLines.empty() && !pFrame->mvpMapLines.empty())
     {
         const float f0 = pFrame->mpCamera ? pFrame->mpCamera->getParameter(0) : 400.f;
-        const double infoLine = double(f0) * double(f0);
+        const double infoLine = 1.0;          // residual is in PIXELS
         for(size_t i = 0; i < pFrame->mvLines.size() && i < pFrame->mvpMapLines.size(); i++)
         {
             MapLine* pML = pFrame->mvpMapLines[i];
             if(!pML || pML->isBad()) continue;
             const LineObs &lo = pFrame->mvLines[i];
             if(pML->mnValidated < 2) continue;   // FIX 4: probation (below)
+            Eigen::Vector3f eS, eE; pML->GetEndpoints(eS, eE);
             EdgeLineOnlyPose* el = new EdgeLineOnlyPose(
-                pML->GetDirection(), pML->GetMoment(), lo.b1u, lo.b2u, lo.cam,
-                pML->mCreateParallax);
+                eS, eE, lo.n, f0, lo.cam, pML->mCreateParallax);
             el->setVertex(0, VP);
             el->setMeasurement(Eigen::Vector2d::Zero());
             // FIX 3: the landmark is NOT noiseless. Its plane was triangulated
