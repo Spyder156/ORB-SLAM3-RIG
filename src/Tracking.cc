@@ -656,6 +656,10 @@ void Tracking::newParameterLoader(Settings *settings) {
             const int   gth  = lfs["Lines.gradThresh"].empty()   ? 30    : (int)lfs["Lines.gradThresh"];
             const int   mpx  = lfs["Lines.minLenPx"].empty()     ? 15    : (int)lfs["Lines.minLenPx"];
             mbLineReacq = lfs["Lines.reacq"].empty() || (int)lfs["Lines.reacq"] != 0;
+            LocalMapping::skLineOutlierCull =
+                lfs["Lines.outlierCull"].empty() || (int)lfs["Lines.outlierCull"] != 0;
+            LocalMapping::skLineCulling =
+                lfs["Lines.culling"].empty() || (int)lfs["Lines.culling"] != 0;
             if(!lfs["Lines.dumpFrom"].empty()){
                 mnLineDumpFrom = (int)lfs["Lines.dumpFrom"];
                 mnLineDumpTo   = lfs["Lines.dumpTo"].empty() ? mnLineDumpFrom

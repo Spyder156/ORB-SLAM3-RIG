@@ -43,6 +43,11 @@ class Atlas;
 class LocalMapping
 {
 public:
+    /// Lines.outlierCull / Lines.culling in the settings file (default on).
+    /// Off isolates the residual change from the culling passes for A/B tests.
+    static bool skLineOutlierCull;
+    static bool skLineCulling;
+
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
     LocalMapping(System* pSys, Atlas* pAtlas, const float bMonocular, bool bInertial, const string &_strSeqName=std::string());
 

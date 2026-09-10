@@ -32,6 +32,9 @@
 namespace ORB_SLAM3
 {
 
+bool LocalMapping::skLineOutlierCull = true;
+bool LocalMapping::skLineCulling = true;
+
 LocalMapping::LocalMapping(System* pSys, Atlas *pAtlas, const float bMonocular, bool bInertial, const string &_strSeqName):
     mpSystem(pSys), mbMonocular(bMonocular), mbInertial(bInertial), mbResetRequested(false), mbResetRequestedActiveMap(false), mbFinishRequested(false), mbFinished(true), mpAtlas(pAtlas), bInitializing(false),
     mbAbortBA(false), mbStopped(false), mbStopRequested(false), mbNotStop(false), mbAcceptKeyFrames(true),
@@ -95,8 +98,8 @@ void LocalMapping::Run()
 
             // Check recent MapPoints
             MapPointCulling();
-            MapLineCulling();
-            RemoveLineOutliers();
+            if(skLineCulling)     MapLineCulling();
+            if(skLineOutlierCull) RemoveLineOutliers();
 #ifdef REGISTER_TIMES
             std::chrono::steady_clock::time_point time_EndMPCulling = std::chrono::steady_clock::now();
 
