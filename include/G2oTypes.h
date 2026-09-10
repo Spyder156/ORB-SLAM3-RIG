@@ -356,16 +356,33 @@ public:
  * an edge is fitting noise -- that is the aperture problem, and it is why the
  * endpoints are used only as bearings ON the plane, never as matched points.
  */
+/// Angular distance [rad] of an endpoint, seen at X_c, from the OBSERVED great
+/// circle with unit normal n_obs. The measurement (n_obs) comes straight from
+/// the detector and is constant; the PREDICTION is the endpoint's bearing.
+/// That ordering is the whole fix -- nothing that varies gets normalised by a
+/// quantity that can go to zero. Sliding an endpoint ALONG the line leaves the
+/// bearing on the same great circle, so this stays aperture-safe.
+inline double LineEndpointResidual(const Eigen::Vector3d &n_obs,
+                                   const Eigen::Vector3d &X_c)
+{
+    const double r = X_c.norm();
+    if (r < 1e-9) return 0.0;               // guarded by cheirality, not here
+    return std::asin(std::max(-1.0, std::min(1.0, n_obs.dot(X_c) / r)));
+}
+
 class EdgeLineOnlyPose : public g2o::BaseUnaryEdge<2, Eigen::Vector2d, VertexPose>
 {
 public:
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 
-    EdgeLineOnlyPose(const Eigen::Vector3f &d_w, const Eigen::Vector3f &m_w,
-                     const Eigen::Vector3f &b1, const Eigen::Vector3f &b2,
+    /// e1_w/e2_w: the landmark's two ENDPOINTS in the world frame (fixed here).
+    /// n_obs: the observed interpretation-plane unit normal in the OBSERVING
+    /// lens frame. focal: pixels per radian, so the residual is in pixels.
+    EdgeLineOnlyPose(const Eigen::Vector3f &e1_w, const Eigen::Vector3f &e2_w,
+                     const Eigen::Vector3f &n_obs, float focal,
                      int cam_idx_ = 0, float createParallax = 0.f)
-        : dw(d_w.cast<double>()), mw(m_w.cast<double>()),
-          bb1(b1.cast<double>().normalized()), bb2(b2.cast<double>().normalized()),
+        : Sw(e1_w.cast<double>()), Ew(e2_w.cast<double>()),
+          nobs(n_obs.cast<double>().normalized()), f(double(focal)),
           cam_idx(cam_idx_), parallax(createParallax) {}
 
     virtual bool read(std::istream &is) { return false; }
@@ -376,35 +393,176 @@ public:
         const VertexPose *VP = static_cast<const VertexPose *>(_vertices[0]);
         const Eigen::Matrix3d &Rcw = VP->estimate().Rcw[cam_idx];
         const Eigen::Vector3d &tcw = VP->estimate().tcw[cam_idx];
-        Eigen::Vector3d n = Rcw * mw + tcw.cross(Rcw * dw);
-        const double nn = n.norm();
-        if (nn < 1e-9) { _error.setZero(); return; }
-        n /= nn;
-        _error << n.dot(bb1), n.dot(bb2);
+        const Eigen::Vector3d S_c = Rcw * Sw + tcw;
+        const Eigen::Vector3d E_c = Rcw * Ew + tcw;
+        _error << f * LineEndpointResidual(nobs, S_c),
+                  f * LineEndpointResidual(nobs, E_c);
     }
 
-    /// Cheirality for a line: intersect both observed bearings with the
-    /// landmark in THIS camera; both must be at positive depth. The n.b
-    /// residual is mirror-invariant, so without this a landmark behind the
-    /// camera scores like one in front.
+    /// Both endpoints in front of this lens.
     bool isDepthPositive()
     {
         const VertexPose *VP = static_cast<const VertexPose *>(_vertices[0]);
         const Eigen::Matrix3d &Rcw = VP->estimate().Rcw[cam_idx];
         const Eigen::Vector3d &tcw = VP->estimate().tcw[cam_idx];
-        const Eigen::Vector3d d_c = Rcw * dw;
-        const Eigen::Vector3d m_c = Rcw * mw + tcw.cross(d_c);
-        for(const Eigen::Vector3d* b : {&bb1, &bb2}){
-            const Eigen::Vector3d cr = b->cross(d_c);
-            const double den = cr.squaredNorm();
-            if(den < 1e-12 || m_c.dot(cr)/den <= 0.0) return false;
-        }
-        return true;
+        return (Rcw * Sw + tcw)(2) > 0.05 && (Rcw * Ew + tcw)(2) > 0.05;
     }
 
-    Eigen::Vector3d dw, mw, bb1, bb2;
+    Eigen::Vector3d Sw, Ew, nobs;
+    double f;
     int cam_idx;
     float parallax = 0.f;   ///< creation parallax [rad]
+};
+
+/**
+ * Orthonormal 3D-line state for BA (Bartoli & Sturm): U in SO(3), scalar w.
+ * Plucker coordinates read out as
+ *
+ *     d = U*e3  (unit direction),   m = (cos w / sin w) * U*e1
+ *
+ * (same convention documented in MapLine.h). Minimal 4-DoF update
+ * (3 for U, 1 for w) -- no gauge freedom, endpoints never parametrised.
+ */
+struct OrthonormalLine
+{
+    EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+    Eigen::Matrix3d U = Eigen::Matrix3d::Identity();
+    double w = M_PI/2.0;    // cot(pi/2) = 0: line through the origin
+
+    // Build from Plucker (d, m): d unit, m = p x d (so m is perp to d).
+    void FromPlucker(const Eigen::Vector3d &d, const Eigen::Vector3d &m)
+    {
+        const Eigen::Vector3d dn = d.normalized();
+        // m projected perpendicular to d (numerically enforce m.d = 0)
+        Eigen::Vector3d mp = m - m.dot(dn)*dn;
+        const double rho = mp.norm();   // distance of line from origin
+        Eigen::Vector3d m1;
+        if(rho > 1e-12)
+            m1 = mp/rho;
+        else                            // line through origin: any unit perp d
+            m1 = (std::fabs(dn.x()) < 0.9 ? Eigen::Vector3d::UnitX().cross(dn)
+                                          : Eigen::Vector3d::UnitY().cross(dn)).normalized();
+        U.col(0) = m1;
+        U.col(2) = dn;
+        U.col(1) = dn.cross(m1);        // right-handed: e1 x e2 = e3 => e2 = e3 x e1
+        w = std::atan2(1.0, rho);       // cot(w) = rho, w in (0, pi/2]
+    }
+    Eigen::Vector3d Dir() const { return U.col(2); }
+    Eigen::Vector3d Mom() const
+    {
+        const double s = std::sin(w);
+        const double c = std::cos(w);
+        return (std::fabs(s) > 1e-9 ? c/s : c/1e-9) * U.col(0);
+    }
+    void Update(const double *v)        // v = [dtheta(3), dw]
+    {
+        U = U * ExpSO3(v[0], v[1], v[2]);
+        w += v[3];
+    }
+};
+
+/**
+ * Line vertex: the TWO 3D ENDPOINTS in the world frame, 6 DoF.
+ *
+ * This replaces a minimal 4-DoF orthonormal/Plucker vertex. The minimal form
+ * forces the residual to be built from the line's moment ABOUT THE CAMERA
+ * CENTRE, n = R m + t x (R d), which must be normalised -- and |n| IS the
+ * camera-to-line distance, so normalising deletes it. A line threaded through
+ * the camera centres then scores EXACTLY ZERO on every observation (verified),
+ * i.e. a free global minimum that fits better than the truth.
+ *
+ * With endpoints there is no such escape: an endpoint at the camera centre has
+ * no bearing and is killed by cheirality. This is what every published
+ * point+line SLAM does (PLVS VertexSBALine<6>, ORB-LINE-SLAM
+ * VertexSBALineXYZ, Structure-SLAM / RGBD-PL-SLAM VertexSBAPointXYZ).
+ *
+ * The 2 DoF of sliding along the line are gauge (unobservable, aperture
+ * problem) and are left to LM damping exactly as those references do.
+ */
+class VertexLine : public g2o::BaseVertex<6, Vector6d>
+{
+public:
+    EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+    VertexLine() {}
+    VertexLine(const Eigen::Vector3f &e1_w, const Eigen::Vector3f &e2_w)
+    {
+        Vector6d v;
+        v.head<3>() = e1_w.cast<double>();
+        v.tail<3>() = e2_w.cast<double>();
+        setEstimate(v);
+    }
+    virtual bool read(std::istream &is) { return false; }
+    virtual bool write(std::ostream &os) const { return false; }
+    virtual void setToOriginImpl() { _estimate.setZero(); }
+    virtual void oplusImpl(const double *update_)
+    {
+        Eigen::Map<const Vector6d> v(update_);
+        _estimate += v;
+    }
+};
+
+
+/**
+ * The BINARY line edge: same plane residual as EdgeLineOnlyPose, but the line
+ * is a vertex too -- this is what lets Local BA refine a MapLine from every
+ * keyframe that saw it, exactly as EdgeMono does for MapPoints.
+ *
+ *     e = [ n_c . b1 , n_c . b2 ],   n_c = R m + t x (R d)  (normalised)
+ *
+ * No linearizeOplus: g2o numeric-differentiates through both vertices' oplus
+ * (right-perturbation for the pose, orthonormal update for the line), the
+ * same discipline as the unary edge.
+ */
+/**
+ * Binary line edge: endpoints (VertexLine) x pose. Two rows, one per endpoint,
+ * each the angular distance of that endpoint from the OBSERVED great circle,
+ * scaled to PIXELS by the focal length so the chi2/robust thresholds are the
+ * same numbers points use.
+ *
+ * measurement: n_obs, the observed interpretation-plane unit normal
+ *              (b1_obs x b2_obs from the detected segment, in the OBSERVING
+ *              lens frame) -- a constant, exactly like the 2D line coefficients
+ *              PLVS/ORB-LINE-SLAM feed their line edges.
+ */
+class EdgeLine : public g2o::BaseBinaryEdge<2, Eigen::Vector3d, VertexLine, VertexPose>
+{
+public:
+    EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+
+    EdgeLine(const Eigen::Vector3f &n_obs, float focal, int cam_idx_ = 0)
+        : nobs(n_obs.cast<double>().normalized()), f(double(focal)), cam_idx(cam_idx_) {}
+
+    virtual bool read(std::istream &is) { return false; }
+    virtual bool write(std::ostream &os) const { return false; }
+
+    void computeError()
+    {
+        const VertexLine *VL = static_cast<const VertexLine *>(_vertices[0]);
+        const VertexPose *VP = static_cast<const VertexPose *>(_vertices[1]);
+        const Eigen::Matrix3d &Rcw = VP->estimate().Rcw[cam_idx];
+        const Eigen::Vector3d &tcw = VP->estimate().tcw[cam_idx];
+        const Eigen::Vector3d S_c = Rcw * VL->estimate().head<3>() + tcw;
+        const Eigen::Vector3d E_c = Rcw * VL->estimate().tail<3>() + tcw;
+        _error << f * LineEndpointResidual(nobs, S_c),
+                  f * LineEndpointResidual(nobs, E_c);
+    }
+
+    /// Both endpoints must be in front of this lens (what PLVS and
+    /// ORB-LINE-SLAM check). Replaces the old mirror-solution test.
+    bool isDepthPositive()
+    {
+        const VertexLine *VL = static_cast<const VertexLine *>(_vertices[0]);
+        const VertexPose *VP = static_cast<const VertexPose *>(_vertices[1]);
+        const Eigen::Matrix3d &Rcw = VP->estimate().Rcw[cam_idx];
+        const Eigen::Vector3d &tcw = VP->estimate().tcw[cam_idx];
+        const Eigen::Vector3d S_c = Rcw * VL->estimate().head<3>() + tcw;
+        const Eigen::Vector3d E_c = Rcw * VL->estimate().tail<3>() + tcw;
+        return S_c(2) > 0.05 && E_c(2) > 0.05;
+    }
+
+    Eigen::Vector3d nobs;
+    double f;
+    int cam_idx;
 };
 
 class EdgeMono : public g2o::BaseBinaryEdge<2,Eigen::Vector2d,g2o::VertexSBAPointXYZ,VertexPose>

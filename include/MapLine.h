@@ -1,30 +1,34 @@
 /**
  * MapLine.h -- a 3D line landmark.
  *
- * PARAMETERISATION. A 3D line has 4 DoF. Storing two endpoints (6 numbers)
- * over-parameterises it and lets the endpoints slide along the line during
- * optimisation without changing the residual -- a gauge freedom that makes the
- * normal equations singular. We store the ORTHONORMAL representation
- * (Bartoli & Sturm, CVIU 2005): a rotation U in SO(3) and an angle w, from
- * which the Plucker coordinates are
+ * PARAMETERISATION. TWO 3D ENDPOINTS in the world frame (6 numbers); the
+ * Plucker pair (d,m) is a cache derived from them. This is what every
+ * published point+line SLAM uses -- PLVS VertexSBALine<6>, ORB-LINE-SLAM
+ * VertexSBALineXYZ, Structure-SLAM / RGBD-PL-SLAM VertexSBAPointXYZ per
+ * endpoint.
  *
- *     direction d = U * e3 ,   moment m = cos(w)/sin(w) * (U * e1)
+ * We previously used the minimal 4-DoF orthonormal form (Bartoli & Sturm).
+ * It is elegant but its residual has to be built from the line's moment ABOUT
+ * THE CAMERA CENTRE, n = R m + t x (R d), which must be normalised -- and |n|
+ * IS the camera-to-line distance. Normalising deletes it, so a line threaded
+ * through the camera centres scores EXACTLY ZERO on every observation and the
+ * optimiser prefers it to the truth. Endpoints have no such escape: an
+ * endpoint at a camera centre has no bearing and is killed by cheirality.
  *
- * That is exactly 4 DoF, minimal and singularity-free.
- *
- * RESIDUAL. For a camera with pose (Rcw, tcw), the line's moment in the camera
- * frame gives the great-circle normal
- *
- *     n_c = normalize( Rcw * m + tcw x (Rcw * d) )
- *
- * and an observed bearing b on the line satisfies  n_c . b = 0. We use the
- * angular distance of each observed ENDPOINT bearing to that plane. It is
- * invariant to sliding along the line, so we never pretend to know where along
- * the edge we are -- the aperture problem, respected rather than fought.
+ * RESIDUAL (see EdgeLine / EdgeLineOnlyPose). Project each endpoint into the
+ * observing lens and take its angular distance from the OBSERVED great circle,
+ * scaled to pixels. The measurement is the observed plane normal (a constant
+ * from the detector); the prediction is the endpoint bearing. Sliding an
+ * endpoint ALONG the line leaves it on the same great circle, so the residual
+ * is blind to it -- the aperture problem, respected. That blindness is gauge:
+ * BA would happily slide both endpoints together until the segment collapses
+ * to a point, so the extent is RE-DERIVED from the observations after every
+ * BA writeback rather than left as a free parameter.
  */
 #ifndef MAPLINE_H
 #define MAPLINE_H
 
+#include <atomic>
 #include <map>
 #include <mutex>
 
@@ -42,9 +46,18 @@ public:
             KeyFrame* pRefKF, Map* pMap);
 
     /// Plucker (direction, moment), always kept normalised and orthogonal.
+    /// DERIVED from the endpoints -- the endpoints are the state now (see the
+    /// note at the top of this header).
     Eigen::Vector3f GetDirection();
     Eigen::Vector3f GetMoment();
     void SetPlucker(const Eigen::Vector3f& d, const Eigen::Vector3f& m);
+
+    /// THE STATE. Two 3D endpoints in the WORLD frame; (d,m) is recomputed
+    /// from them. This is what every published point+line SLAM optimises
+    /// (PLVS VertexSBALine<6>, ORB-LINE-SLAM VertexSBALineXYZ,
+    /// Structure-SLAM / RGBD-PL-SLAM VertexSBAPointXYZ per endpoint).
+    void SetEndpoints(const Eigen::Vector3f& e1, const Eigen::Vector3f& e2);
+    void GetEndpoints(Eigen::Vector3f& e1, Eigen::Vector3f& e2);
 
     /// Great-circle normal this line should produce in a camera at (Rcw,tcw).
     Eigen::Vector3f NormalInCamera(const Eigen::Matrix3f& Rcw,
@@ -85,8 +98,19 @@ public:
 
     long unsigned int mnId;
     static long unsigned int nNextId;
+    /// Extent-gate audit counters (see MapLine.cc).
+    static std::atomic<long> nRejParallel, nRejDepth, nRejRatio, nRejLong, nAccepted;
     long unsigned int mnBALocalForKF = 0;
     int mnVisible = 1, mnFound = 1;
+    /// Fraction of the frames in which this landmark was PREDICTED to be
+    /// visible where a segment actually bound to it. The line analogue of
+    /// MapPoint::GetFoundRatio(); MapLineCulling kills anything below 0.25,
+    /// exactly as PLVS does.
+    float GetFoundRatio() const { return float(mnFound) / std::max(1, mnVisible); }
+    /// Keyframe this landmark was first attached to (-1 until then). Used by
+    /// MapLineCulling to give a new landmark a couple of keyframes to prove
+    /// itself before demanding a minimum observation count.
+    long int mnFirstKFid = -1;
     /// Angular extent of the observation that created this line [rad]. Only
     /// used to draw a segment of sensible length -- the line itself is infinite.
     float mAngLen = 0.05f;
@@ -98,6 +122,15 @@ public:
     /// independent confirmation -- the analogue of MapPointCulling's
     /// 3-observation rule for points.
     int mnValidated = 0;
+
+    /// Rig lens that created this line (0 front, 1 rear). Re-acquisition
+    /// only proposes a landmark to segments of ITS lens -- matching never
+    /// crosses lenses anywhere in the pipeline.
+    int mnCam = 0;
+    // Re-acquisition bookkeeping, TRACKING THREAD ONLY (no lock):
+    long mnLastFrameSeen = -1;     ///< frame id this landmark last bound a segment
+    bool mbInReacqPool = false;    ///< currently in Tracking's recent-lines pool
+    long mnValidatedFrameId = -1;  ///< guard: re-acq validates once per frame
 
     /// First observation (plane normal + lens pose), kept so the line can be
     /// RE-TRIANGULATED against later, wider-baseline observations -- the
@@ -121,6 +154,8 @@ public:
     Eigen::Vector3f mEnd1 = Eigen::Vector3f::Zero();
     Eigen::Vector3f mEnd2 = Eigen::Vector3f::Zero();
     bool mbHasExtent = false;
+    /// Sightings folded into the extent average (viz-only, like the extent).
+    int mnExtentObs = 0;
 
     /// Intersect the two endpoint bearings with this line to recover the
     /// observed segment. For bearing b and line (d_c, m_c) in camera

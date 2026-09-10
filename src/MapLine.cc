@@ -1,4 +1,6 @@
 #include "MapLine.h"
+#include "Map.h"
+#include "KeyFrame.h"
 
 #include <cmath>
 
@@ -9,12 +11,37 @@
 namespace ORB_SLAM3 {
 
 long unsigned int MapLine::nNextId = 0;
+// Extent-gate audit: which test refuses to record where a line was seen.
+// A refused observation leaves the landmark with NO extent, so it is dropped
+// from the map dump entirely -- a systematic filter on WHICH GEOMETRY the map
+// is allowed to contain, not a neutral safety check.
+std::atomic<long> MapLine::nRejParallel{0}, MapLine::nRejDepth{0},
+                  MapLine::nRejRatio{0}, MapLine::nRejLong{0},
+                  MapLine::nAccepted{0};
 
 MapLine::MapLine(const Eigen::Vector3f& d, const Eigen::Vector3f& m,
                  KeyFrame* pRefKF, Map* pMap)
     : mpRefKF(pRefKF), mpMap(pMap) {
     SetPlucker(d, m);
     mnId = nNextId++;
+}
+
+void MapLine::SetEndpoints(const Eigen::Vector3f& e1, const Eigen::Vector3f& e2) {
+    std::unique_lock<std::mutex> lk(mMutexPos);
+    mEnd1 = e1; mEnd2 = e2; mbHasExtent = true;
+    // (d,m) is a CACHE derived from the endpoints, so every existing consumer
+    // (matching gates, NormalInCamera, AngularError) keeps working unchanged.
+    Eigen::Vector3f d = e2 - e1;
+    const float n = d.norm();
+    if (n > 1e-9f) {
+        mDir = d / n;
+        mMom = e1.cross(mDir);          // moment about the world origin
+    }
+}
+
+void MapLine::GetEndpoints(Eigen::Vector3f& e1, Eigen::Vector3f& e2) {
+    std::unique_lock<std::mutex> lk(mMutexPos);
+    e1 = mEnd1; e2 = mEnd2;
 }
 
 void MapLine::SetPlucker(const Eigen::Vector3f& d, const Eigen::Vector3f& m) {
@@ -25,6 +52,17 @@ void MapLine::SetPlucker(const Eigen::Vector3f& d, const Eigen::Vector3f& m) {
     // Numerical drift breaks that, and a non-orthogonal pair is not a line at
     // all, so re-project every time rather than trusting the caller.
     mMom = m - mDir * (mDir.dot(m));
+    // THE EXTENT BELONGS TO THE LINE. Whenever (d,m) moves -- every Local BA
+    // refinement -- endpoints recorded against the OLD line are no longer on
+    // this one, and everything that draws or reasons about extent then places
+    // the segment where the line is not (measured: 24% of landmarks adrift,
+    // worst 35 m). Slide them onto the new line along its direction: the
+    // observed interval is preserved, the geometry stays consistent.
+    if (mbHasExtent) {
+        const Eigen::Vector3f p0 = mDir.cross(mMom);   // closest point to origin
+        mEnd1 = p0 + mDir * (mEnd1 - p0).dot(mDir);
+        mEnd2 = p0 + mDir * (mEnd2 - p0).dot(mDir);
+    }
 }
 
 Eigen::Vector3f MapLine::GetDirection() {
@@ -99,42 +137,49 @@ bool MapLine::SetExtentFromBearings(const Eigen::Matrix3f& Rcw,
     const Eigen::Vector3f m_c = Rcw * m_w + tcw.cross(d_c);
 
     float s1v = 0.f, s2v = 0.f;
+    int why = 0;   // which gate refused: 1 near-parallel, 2 depth range
     auto onLine = [&](const Eigen::Vector3f& b, Eigen::Vector3f& x_w, float& sv) {
         const Eigen::Vector3f cr = b.cross(d_c);
         const float den = cr.squaredNorm();
         // sin(bearing, line) >= sin(8 deg): nearly-parallel geometry amplifies
         // moment noise by 1/sin^2 and produced tens-of-metre radial spikes
-        if (!std::isfinite(den) || den < 0.0194f) return false;
+        if (!std::isfinite(den) || den < 0.0194f) { why = 1; return false; }
         const float s = m_c.dot(cr) / den;
-        if (!std::isfinite(s) || s <= 0.05f || s > maxDepth) return false;
+        if (!std::isfinite(s) || s <= 0.05f || s > maxDepth) { why = 2; return false; }
         sv = s;
         x_w = Rcw.transpose() * (s * b - tcw);
         return x_w.allFinite();
     };
     Eigen::Vector3f e1, e2;
-    if (!onLine(b1, e1, s1v) || !onLine(b2, e2, s2v)) return false;
+    if (!onLine(b1, e1, s1v) || !onLine(b2, e2, s2v)) {
+        (why == 1 ? nRejParallel : nRejDepth)++;
+        return false;
+    }
     // the two endpoint depths of one observed segment cannot differ wildly,
     // and an indoor segment is not tens of metres long
-    if (std::max(s1v, s2v) > 5.f * std::min(s1v, s2v)) return false;
-    if ((e2 - e1).norm() > 20.f) return false;
+    if (std::max(s1v, s2v) > 5.f * std::min(s1v, s2v)) { nRejRatio++; return false; }
+    if ((e2 - e1).norm() > 20.f) { nRejLong++; return false; }
+    nAccepted++;
     std::unique_lock<std::mutex> lk(mMutexPos);
     if (!mbHasExtent) {
-        mEnd1 = e1; mEnd2 = e2; mbHasExtent = true;
+        mEnd1 = e1; mEnd2 = e2; mbHasExtent = true; mnExtentObs = 1;
     } else {
-        // UNION with the stored extent: every sighting extends the landmark
-        // along its direction instead of replacing it, so many short
-        // observations of one physical edge accumulate into one long segment.
+        // AVERAGE of the observed intervals, not the union. Union only ever
+        // grows, so one spuriously long detection permanently stretches the
+        // segment past the physical edge; the running mean converges to the
+        // typically-observed extent instead.
+        // Parameterise both intervals along mDir from p0, low end to high end.
         const Eigen::Vector3f p0 = mEnd1;
-        float tmin = 0.f, tmax = (mEnd2 - p0).dot(mDir);
-        if (tmax < tmin) std::swap(tmin, tmax);
-        for (const Eigen::Vector3f* e : {&e1, &e2}) {
-            const float t = (*e - p0).dot(mDir);
-            tmin = std::min(tmin, t); tmax = std::max(tmax, t);
-        }
-        if (tmax - tmin <= 25.f) {          // sanity: no runaway growth
-            mEnd1 = p0 + tmin * mDir;
-            mEnd2 = p0 + tmax * mDir;
-        }
+        float lo0 = 0.f, hi0 = (mEnd2 - p0).dot(mDir);
+        if (hi0 < lo0) std::swap(lo0, hi0);
+        float lo1 = (e1 - p0).dot(mDir), hi1 = (e2 - p0).dot(mDir);
+        if (hi1 < lo1) std::swap(lo1, hi1);
+        const float n = float(mnExtentObs);
+        const float lo = (lo0 * n + lo1) / (n + 1.f);
+        const float hi = (hi0 * n + hi1) / (n + 1.f);
+        mEnd1 = p0 + lo * mDir;
+        mEnd2 = p0 + hi * mDir;
+        mnExtentObs++;
     }
     return true;
 }
@@ -200,9 +245,20 @@ int MapLine::Observations() {
 }
 
 void MapLine::SetBadFlag() {
-    std::unique_lock<std::mutex> lk(mMutexFeatures);
-    mbBad = true;
-    mObservations.clear();
+    // Mirror MapPoint::SetBadFlag: drop the landmark from every keyframe that
+    // holds it AND from the map, not just flag it. A flagged-but-reachable
+    // landmark keeps being drawn, keeps entering BA, and keeps voting.
+    std::map<KeyFrame*, int> obs;
+    {
+        std::unique_lock<std::mutex> lk(mMutexFeatures);
+        std::unique_lock<std::mutex> lk2(mMutexPos);
+        mbBad = true;
+        obs = mObservations;
+        mObservations.clear();
+    }
+    for (std::map<KeyFrame*, int>::iterator it = obs.begin(); it != obs.end(); it++)
+        if (it->first) it->first->EraseMapLineMatch(this);
+    if (mpMap) mpMap->EraseMapLine(this);
 }
 
 bool MapLine::isBad() {
