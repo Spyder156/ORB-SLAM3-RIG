@@ -42,6 +42,7 @@ std::vector<LineObs> LineExtractor::Extract(const cv::Mat& imGray,
     upm::Segments segs = elsed.detect(imGray);
     out.reserve(segs.size());
 
+    mpCamForMerge = pCam;
     const cv::Mat& msk = (camIdx >= 0 && camIdx <= 1) ? mMask[camIdx] : cv::Mat();
     for (const auto& s : segs) {
         const cv::Point2f a(s[0], s[1]), b(s[2], s[3]);
@@ -80,8 +81,102 @@ std::vector<LineObs> LineExtractor::Extract(const cv::Mat& imGray,
         if (dn < 1e-9f) continue;
         lo.dir = d / dn;
         lo.angLen = ang;
+    lo.pxPerRad = ang > 1e-6f ? float(cv::norm(a - b)) / ang : 400.f;
         lo.cam = camIdx;
         out.push_back(lo);
+    }
+    if (mbMergeCircles) out = MergeGreatCircles(out);
+    return out;
+}
+
+std::vector<LineObs> LineExtractor::MergeGreatCircles(
+        const std::vector<LineObs>& in) const {
+    // ONE PHYSICAL EDGE, ONE OBSERVATION.
+    //
+    // ELSED breaks a long edge into several segments, and it breaks it
+    // DIFFERENTLY every frame. All those fragments share one great circle, so
+    // the matcher -- which gates on the plane normal -- cannot tell them apart:
+    // frame to frame it binds fragment 1, then fragment 2, then fragment 1
+    // again. The track survives but the observed extent jumps between pieces of
+    // the edge, so the depth is triangulated from observations of different
+    // physical pieces. That is the "three pencils in a row" failure.
+    //
+    // Merge every collinear fragment into a single circle observation: same
+    // plane, extent = the union arc. The matching unit becomes the CIRCLE, so
+    // fragmentation and endpoint clipping stop being able to move it.
+    std::vector<LineObs> out;
+    if (in.empty()) return out;
+    const float cN = std::cos(mMergeNormalRad);
+    std::vector<bool> used(in.size(), false);
+
+    for (size_t i = 0; i < in.size(); ++i) {
+        if (used[i]) continue;
+        // in-plane frame of this circle, so members can be ordered along it
+        const Eigen::Vector3f n0 = in[i].n;
+        Eigen::Vector3f u = in[i].b1u - n0 * n0.dot(in[i].b1u);
+        if (u.norm() < 1e-6f) { out.push_back(in[i]); used[i] = true; continue; }
+        u.normalize();
+        const Eigen::Vector3f v = n0.cross(u);
+        auto ang = [&](const Eigen::Vector3f& b) {
+            return std::atan2(b.dot(v), b.dot(u));
+        };
+        struct Piece { float lo, hi; size_t idx; };
+        std::vector<Piece> pieces;
+        auto add = [&](size_t k) {
+            float a1 = ang(in[k].b1u), a2 = ang(in[k].b2u);
+            if (a1 > a2) std::swap(a1, a2);
+            if (a2 - a1 > float(M_PI)) { const float t = a1; a1 = a2; a2 = t + 2.f*float(M_PI); }
+            pieces.push_back({a1, a2, k});
+        };
+        add(i); used[i] = true;
+        for (size_t j = i + 1; j < in.size(); ++j) {
+            if (used[j] || in[j].cam != in[i].cam) continue;
+            if (std::fabs(n0.dot(in[j].n)) < cN) continue;   // not the same circle
+            add(j); used[j] = true;
+        }
+        if (pieces.size() == 1) { out.push_back(in[i]); continue; }
+
+        // union the pieces, but only across SMALL gaps: two fragments far apart
+        // on the same circle may be different edges that merely happen to be
+        // collinear from here, and joining them would invent extent.
+        std::sort(pieces.begin(), pieces.end(),
+                  [](const Piece& a, const Piece& b) { return a.lo < b.lo; });
+        size_t g0 = 0;
+        while (g0 < pieces.size()) {
+            float lo = pieces[g0].lo, hi = pieces[g0].hi;
+            float wSum = hi - lo;
+            Eigen::Vector3f nAcc = in[pieces[g0].idx].n * (hi - lo);
+            size_t g1 = g0 + 1;
+            for (; g1 < pieces.size(); ++g1) {
+                const float gap = pieces[g1].lo - hi;
+                if (gap > mMergeMaxGap * std::max(hi - lo, pieces[g1].hi - pieces[g1].lo))
+                    break;                                   // too far -- new group
+                hi = std::max(hi, pieces[g1].hi);
+                const float w = pieces[g1].hi - pieces[g1].lo;
+                // keep the accumulated normal sign-consistent with n0
+                const Eigen::Vector3f nj = in[pieces[g1].idx].n;
+                nAcc += (nj.dot(n0) < 0.f ? -nj : nj) * w;
+                wSum += w;
+            }
+            LineObs m = in[pieces[g0].idx];                  // inherit cam etc.
+            Eigen::Vector3f nm = nAcc / std::max(wSum, 1e-9f);
+            if (nm.norm() < 1e-7f) nm = n0; else nm.normalize();
+            m.n = nm;
+            m.b1u = (u * std::cos(lo) + v * std::sin(lo)).normalized();
+            m.b2u = (u * std::cos(hi) + v * std::sin(hi)).normalized();
+            m.angLen = hi - lo;
+            Eigen::Vector3f dd = m.b2u - m.b1u;
+            if (dd.norm() > 1e-9f) m.dir = dd.normalized();
+            // pixels of the merged arc ends, for anything that draws them
+            if (mpCamForMerge) {
+                m.p1 = mpCamForMerge->project(cv::Point3f(m.b1u.x(), m.b1u.y(), m.b1u.z()));
+                m.p2 = mpCamForMerge->project(cv::Point3f(m.b2u.x(), m.b2u.y(), m.b2u.z()));
+                m.pxPerRad = m.angLen > 1e-6f
+                           ? float(cv::norm(m.p1 - m.p2)) / m.angLen : 400.f;
+            }
+            if (m.angLen >= mMinAngLen && m.angLen <= mMaxAngLen) out.push_back(m);
+            g0 = g1;
+        }
     }
     return out;
 }
@@ -111,6 +206,13 @@ std::vector<int> LineExtractor::Match(const std::vector<LineObs>& cur,
             // |dir_i.dir_j| is dropped: the chord is the circle's tangent at
             // the segment MIDPOINT, so it tested where the segment sat on the
             // circle rather than whether it was the same line.
+            {   // d_orth in PIXELS: how far this segment's endpoints sit off
+                // the other's great circle, converted with the local image
+                // scale rather than assumed constant across the fisheye.
+                const float s1 = std::asin(std::min(1.f, std::fabs(prev[j].n.dot(cur[i].b1u))));
+                const float s2 = std::asin(std::min(1.f, std::fabs(prev[j].n.dot(cur[i].b2u))));
+                if (0.5f * (s1 + s2) * cur[i].pxPerRad > mGateOrthPx) continue;
+            }
             {
                 const Eigen::Vector3f n = cur[i].n;
                 // in-plane frame centred on this segment

@@ -32,8 +32,8 @@
 namespace ORB_SLAM3
 {
 
-bool LocalMapping::skLineOutlierCull = false;
-bool LocalMapping::skLineCulling = false;
+bool LocalMapping::skLineOutlierCull = true;
+bool LocalMapping::skLineCulling = true;
 
 LocalMapping::LocalMapping(System* pSys, Atlas *pAtlas, const float bMonocular, bool bInertial, const string &_strSeqName):
     mpSystem(pSys), mbMonocular(bMonocular), mbInertial(bInertial), mbResetRequested(false), mbResetRequestedActiveMap(false), mbFinishRequested(false), mbFinished(true), mpAtlas(pAtlas), bInitializing(false),

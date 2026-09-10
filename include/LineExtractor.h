@@ -31,6 +31,12 @@ struct LineObs {
     Eigen::Vector3f n;         ///< unit normal of the great circle, b1 x b2
     Eigen::Vector3f dir;       ///< in-plane direction, for the tracking gate
     float angLen;              ///< angular length [rad] -- NOT pixel length
+    /// Local image scale [px/rad] where this segment sits: its own pixel
+    /// length over its angular length. On a fisheye the pixels-per-radian
+    /// varies strongly from centre to rim, so a single angular gate is not a
+    /// single pixel gate -- LF-PGVIO measures its match residual (d_orth) in
+    /// PIXELS for exactly this reason.
+    float pxPerRad = 400.f;
     int cam;                   ///< 0 = front, 1 = rear (rig camera index)
     long mnLineId = -1;        ///< associated MapLine, -1 if none
     class MapLine* pML = nullptr;  ///< the landmark this track owns, if any
@@ -71,6 +77,9 @@ public:
     /// normal alignment, in-plane direction, angular-length consistency.
     /// Comparisons are sign-free -- a line has no orientation.
     /// Returns cur-index -> prev-index, or -1.
+    /// Collapse collinear fragments of one edge into a single circle.
+    std::vector<LineObs> MergeGreatCircles(const std::vector<LineObs>& in) const;
+
     std::vector<int> Match(const std::vector<LineObs>& cur,
                            const std::vector<LineObs>& prev) const;
 
@@ -80,6 +89,17 @@ public:
     /// Minimum fraction of the SHORTER segment that must overlap the other,
     /// measured as arc along their shared great circle (LF-PGVIO uses 0.5).
     float mGateOverlap = 0.5f;
+    /// Max orthogonal distance of an endpoint from the other segment's great
+    /// circle, in PIXELS (LF-PGVIO: d_orth < 5 px).
+    float mGateOrthPx = 5.0f;
+    /// Merge collinear fragments into one great-circle observation before
+    /// matching (Lines.mergeCircles). Normals within mMergeNormalRad are the
+    /// same circle; fragments are joined across a gap of at most
+    /// mMergeMaxGap x the longer piece.
+    bool  mbMergeCircles = true;
+    float mMergeNormalRad = 0.5f * float(M_PI) / 180.f;   // 0.5 deg
+    float mMergeMaxGap = 1.0f;
+    mutable GeometricCamera* mpCamForMerge = nullptr;
     int mGradThresh, mMinLenPx;
 };
 
