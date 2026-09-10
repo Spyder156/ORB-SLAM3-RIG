@@ -655,6 +655,12 @@ void Tracking::newParameterLoader(Settings *settings) {
             const float maxA = lfs["Lines.maxAngLenDeg"].empty() ? 40.0f : (float)lfs["Lines.maxAngLenDeg"];
             const int   gth  = lfs["Lines.gradThresh"].empty()   ? 30    : (int)lfs["Lines.gradThresh"];
             const int   mpx  = lfs["Lines.minLenPx"].empty()     ? 15    : (int)lfs["Lines.minLenPx"];
+            mbLineReacq = lfs["Lines.reacq"].empty() || (int)lfs["Lines.reacq"] != 0;
+            if(!lfs["Lines.dumpFrom"].empty()){
+                mnLineDumpFrom = (int)lfs["Lines.dumpFrom"];
+                mnLineDumpTo   = lfs["Lines.dumpTo"].empty() ? mnLineDumpFrom
+                                                            : (int)lfs["Lines.dumpTo"];
+            }
             mpLineExtractor = new LineExtractor(minA, maxA, gth, mpx);
             for(int mc = 0; mc < 2; mc++){
                 char key[32]; snprintf(key, sizeof(key), "Lines.mask%d", mc);
@@ -1812,8 +1818,11 @@ Sophus::SE3f Tracking::GrabImageMonoRig(const cv::Mat &im0, const cv::Mat &im1,
                           << " | cheirality: " << audCheirNeg << "/" << audCheirTot
                           << " new lines BEHIND their camera"
                           << " | STALE anchors at triangulation: " << audTriStale
-                          << "/" << audTriTot2 << std::endl;
+                          << "/" << audTriTot2
+                          << " | reacq " << audReacq << " (total " << mnLineReacq
+                          << ")" << std::endl;
                 audNAng = audPxMove = audParallax = 0; audNMatch = audNTri = 0;
+                audReacq = 0;
             }
         // ---- create / carry MapLines -------------------------------------
         // Triangulate a tracked line from the two poses that observed it. The
@@ -1875,6 +1884,7 @@ Sophus::SE3f Tracking::GrabImageMonoRig(const cv::Mat &im0, const cv::Mat &im1,
                     cur.RAnchor = prv.RAnchor; cur.tAnchor = prv.tAnchor;
                     cur.anchorMapVersion = prv.anchorMapVersion;
                 }
+                cur.nSeen = prv.nSeen + 1;      // track age, for LINE_MIN_OBS
 
                 {   // [AUDIT-B] match quality on CONSECUTIVE frames: the
                     // angle between the two camera-frame normals and how far
@@ -1935,6 +1945,7 @@ Sophus::SE3f Tracking::GrabImageMonoRig(const cv::Mat &im0, const cv::Mat &im1,
                         }
                         mCurrentFrame.mvpMapLines[i] = cur.pML;
                         cur.pML->mnVisible++;
+                        cur.pML->mnFound++;       // it was predicted AND bound
                         cur.pML->mnValidated++;   // survived gate + cheirality
 
                         {   // LINES AGE LIKE POINTS, not like snapshots.
@@ -1943,7 +1954,11 @@ Sophus::SE3f Tracking::GrabImageMonoRig(const cv::Mat &im0, const cv::Mat &im1,
                             // the first observation is kept, and when today's
                             // parallax beats the creation parallax by 20% the
                             // line is solved again -- depth sharpens with age.
-                            if(pL->mbHasFirst){
+                            // Once >= 2 keyframes observe the line, Local BA
+                            // refines it from ALL observations (points
+                            // parity) -- the 2-view solve must not overwrite
+                            // the BA estimate.
+                            if(pL->mbHasFirst && pL->Observations() < 2){
                                 const Eigen::Vector3f n1w =
                                     Tc.rotationMatrix().transpose() * cur.n;
                                 const Eigen::Vector3f n2w =
@@ -1978,11 +1993,15 @@ Sophus::SE3f Tracking::GrabImageMonoRig(const cv::Mat &im0, const cv::Mat &im1,
                                     }
                                 }
                             }
-                            // (b) extent union: this sighting's piece extends
-                            // the landmark instead of being thrown away
-                            pL->SetExtentFromBearings(Tc.rotationMatrix(),
-                                                      Tc.translation(),
-                                                      cur.b1u, cur.b2u);
+                            // (b) grow the extent from this sighting -- but
+                            // ONLY while the landmark is not yet a BA unknown.
+                            // The endpoints ARE the optimised state now, so
+                            // once Local BA owns them, re-deriving them from a
+                            // single observation would fight the optimiser.
+                            if(pL->Observations() < 3)
+                                pL->SetExtentFromBearings(Tc.rotationMatrix(),
+                                                          Tc.translation(),
+                                                          cur.b1u, cur.b2u);
                         }
                         nObs++;
                     } else {
@@ -2019,10 +2038,17 @@ Sophus::SE3f Tracking::GrabImageMonoRig(const cv::Mat &im0, const cv::Mat &im1,
                     audParallax += std::asin(std::min(1.f, n1w.cross(n2w).norm()));
                     audNTri++;
                 }
+                // PL-VINS `LINE_MIN_OBS = 5`: a track must be seen by five
+                // frames before it is allowed to become a landmark. Two views
+                // can show good plane parallax and still carry no usable depth.
+                if(cur.nSeen < 5) continue;
+
                 Eigen::Vector3f dw, mw;
+                // parallax gate 3.6 deg (PL-VINS `min_cos_theta > 0.998`),
+                // was 2.0 deg here.
                 if(!MapLine::Triangulate(cur.n, Tc.rotationMatrix(), Tc.translation(),
                                          cur.nAnchor, cur.RAnchor, cur.tAnchor,
-                                         2.0f, dw, mw))
+                                         3.6f, dw, mw))
                     continue;      // still too little angle -- keep accumulating
 
                 {   // DIRECTION GATE. The residual n.b constrains only the
@@ -2077,6 +2103,7 @@ Sophus::SE3f Tracking::GrabImageMonoRig(const cv::Mat &im0, const cv::Mat &im1,
                     continue;
                 }
                 pML->mAngLen = cur.angLen;
+                pML->mnCam = cur.cam;
                 pML->mFirstN = cur.nAnchor;
                 pML->mFirstR = cur.RAnchor;
                 pML->mFirstT = cur.tAnchor;
@@ -2096,6 +2123,193 @@ Sophus::SE3f Tracking::GrabImageMonoRig(const cv::Mat &im0, const cv::Mat &im1,
             }
             mnLineTriangulated += nNew;
             mnLineObs += nObs; mnLineRej += nRej;
+
+            // ---- MAP->FRAME RE-ACQUISITION: SearchByProjection, for lines.
+            // Every recently-seen line landmark predicts its great circle in
+            // the current frame (n_pred = camera-frame moment); any STILL
+            // UNBOUND segment lying on that plane, at positive depth, on an
+            // overlapping piece of the line, binds to it. Many segments may
+            // bind one landmark (each fragment is an independent plane
+            // constraint -- the residual is aperture-blind); a segment binds
+            // at most one landmark (best plane fit). This is what lets a
+            // track survive a missed frame or an ELSED re-fragmentation,
+            // exactly as SearchByProjection does for points.
+            long nReacq = 0;
+            if(mbLineReacq && !mvpLineReacqPool.empty())
+            {
+                const long fid = (long)mCurrentFrame.mnId;
+                struct Cand {
+                    MapLine* pL;
+                    Eigen::Matrix3f R;               // world -> ITS lens
+                    Eigen::Vector3f t;
+                    Eigen::Vector3f n_pred;          // unit plane normal, lens frame
+                    Eigen::Vector3f d_c, m_c;        // line in lens frame
+                    Eigen::Vector3f dw, p0;          // world direction + closest point to origin
+                    float uLo, uHi;                  // observed extent, param along dw from p0
+                };
+                std::vector<Cand> cands; cands.reserve(mvpLineReacqPool.size());
+                for(MapLine* pL : mvpLineReacqPool)
+                {
+                    if(!pL || pL->isBad() || !pL->mbHasExtent) continue;
+                    const Sophus::SE3f Tc = pL->mnCam == 1 ? T_c1 * Tcw_cur : Tcw_cur;
+                    Cand c; c.pL = pL;
+                    c.R = Tc.rotationMatrix(); c.t = Tc.translation();
+                    c.dw = pL->GetDirection();
+                    const Eigen::Vector3f mw = pL->GetMoment();
+                    c.d_c = c.R * c.dw;
+                    c.m_c = c.R * mw + c.t.cross(c.d_c);  // = unnormalised n_pred
+                    const float nn = c.m_c.norm();
+                    if(nn < 1e-9f) continue;
+                    c.n_pred = c.m_c / nn;
+                    // p0 = dw x mw: for unit dw and mw = p x dw this recovers
+                    // the point of the line closest to the world origin
+                    c.p0 = c.dw.cross(mw);
+                    const float u1 = (pL->mEnd1 - c.p0).dot(c.dw);
+                    const float u2 = (pL->mEnd2 - c.p0).dot(c.dw);
+                    c.uLo = std::min(u1, u2); c.uHi = std::max(u1, u2);
+                    c.pL->mnVisible++;   // predicted into this frame
+                    cands.push_back(c);
+                }
+                const float cosPlane = std::cos(0.0524f);   // 3 deg, the matcher's plane gate
+                for(size_t i = 0; i < mCurrentFrame.mvLines.size(); ++i)
+                {
+                    LineObs &cur = mCurrentFrame.mvLines[i];
+                    if(cur.pML) continue;                    // already bound (carry or new)
+                    MapLine* best = nullptr;
+                    float bestR = mfLineReobsMaxRad;         // same bar as carry validation
+                    float bestS1 = 0.f, bestS2 = 0.f;
+                    for(const Cand& c : cands)
+                    {
+                        if(c.pL->mnCam != cur.cam) continue;  // never mix lenses
+                        // cheap prefilter: plane-normal agreement
+                        if(std::fabs(c.n_pred.dot(cur.n)) < cosPlane) continue;
+                        const float r1 = std::asin(std::min(1.f, std::fabs(c.n_pred.dot(cur.b1u))));
+                        const float r2 = std::asin(std::min(1.f, std::fabs(c.n_pred.dot(cur.b2u))));
+                        const float r = std::max(r1, r2);
+                        if(r >= bestR) continue;
+                        // cheirality + WHERE along the line this segment sits
+                        bool ok = true; float uS[2]; float sD[2];
+                        const Eigen::Vector3f* bs[2] = {&cur.b1u, &cur.b2u};
+                        for(int e = 0; e < 2; e++)
+                        {
+                            const Eigen::Vector3f cr = bs[e]->cross(c.d_c);
+                            const float den = cr.squaredNorm();
+                            if(den < 1e-10f){ ok = false; break; }
+                            const float s = c.m_c.dot(cr) / den;   // depth along bearing
+                            if(!(s > 0.05f && s < 40.f)){ ok = false; break; }
+                            sD[e] = s;
+                            const Eigen::Vector3f e_w = c.R.transpose() * (s * (*bs[e]) - c.t);
+                            uS[e] = (e_w - c.p0).dot(c.dw);
+                        }
+                        if(!ok) continue;
+                        // EXTENT OVERLAP -- the correspondence check the
+                        // aperture-blind residual cannot do: a collinear
+                        // segment of a DIFFERENT physical edge shares the
+                        // plane but not the interval.
+                        const float lo = std::min(uS[0], uS[1]), hi = std::max(uS[0], uS[1]);
+                        const float mar = 0.3f * std::max(hi - lo, c.uHi - c.uLo) + 0.05f;
+                        if(lo > c.uHi + mar || hi < c.uLo - mar) continue;
+                        best = c.pL; bestR = r; bestS1 = sD[0]; bestS2 = sD[1];
+                    }
+                    if(best)
+                    {
+                        (void)bestS1; (void)bestS2;
+                        cur.pML = best;
+                        mCurrentFrame.mvpMapLines[i] = best;
+                        best->mnFound++;          // bound this frame
+                        // validation graduates once per FRAME, not once per
+                        // fragment -- 3 fragments of one edge are one sighting
+                        if(best->mnValidatedFrameId != fid){
+                            best->mnValidated++;
+                            best->mnValidatedFrameId = fid;
+                        }
+                        if(best->Observations() < 3){
+                            const Sophus::SE3f Tc = cur.cam == 1 ? T_c1 * Tcw_cur : Tcw_cur;
+                            best->SetExtentFromBearings(Tc.rotationMatrix(), Tc.translation(),
+                                                        cur.b1u, cur.b2u);
+                        }
+                        nReacq++;
+                    }
+                }
+                mnLineReacq += nReacq; audReacq += nReacq;
+            }
+
+            // ---- pool upkeep: every landmark bound in THIS frame (carried,
+            // created or re-acquired) joins or refreshes; unseen for 90
+            // frames (3 s) drops out. Tracking thread only.
+            {
+                const long fid = (long)mCurrentFrame.mnId;
+                for(size_t i = 0; i < mCurrentFrame.mvLines.size(); ++i)
+                {
+                    MapLine* pL = mCurrentFrame.mvLines[i].pML;
+                    if(!pL || pL->isBad()) continue;
+                    pL->mnLastFrameSeen = fid;
+                    if(!pL->mbInReacqPool){ pL->mbInReacqPool = true; mvpLineReacqPool.push_back(pL); }
+                }
+                std::vector<MapLine*> keep; keep.reserve(mvpLineReacqPool.size());
+                for(MapLine* pL : mvpLineReacqPool)
+                {
+                    if(pL->isBad() || fid - pL->mnLastFrameSeen > 90){ pL->mbInReacqPool = false; continue; }
+                    keep.push_back(pL);
+                }
+                mvpLineReacqPool.swap(keep);
+            }
+
+            // ---- PER-OBSERVATION DUMP (Lines.dumpFrom/dumpTo in settings).
+            // For each landmark BOUND in this frame, write the detected
+            // segment next to the landmark's own extent expressed in THIS
+            // camera. No world frame, no trajectory, no occlusion: the only
+            // question asked is whether the 3D landmark the estimator is
+            // using explains the 2D segment it is bound to.
+            //   e*: landmark extent endpoints in the OBSERVING lens frame [m]
+            //   r*: angular residual of each observed bearing to the
+            //       landmark's plane [deg]
+            if(mnLineDumpFrom >= 0 && (long)mCurrentFrame.mnId >= mnLineDumpFrom
+               && (long)mCurrentFrame.mnId <= mnLineDumpTo)
+            {
+                if(!mLineDumpFile.is_open()){
+                    mLineDumpFile.open("line_obs_dump.csv");
+                    mLineDumpFile << "fid,cam,id,validated,x1,y1,x2,y2,"
+                                     "e1x,e1y,e1z,e2x,e2y,e2z,r1deg,r2deg\n";
+                }
+                {   // THE POSE THE ESTIMATOR ACTUALLY USED, per lens, so any
+                    // offline reconstruction of T_cw (from the trajectory file
+                    // + T_b_c + rig transform) can be DIFFED against truth
+                    // instead of trusted. Row-major 3x4 [R|t], world->lens.
+                    std::ofstream pf("frame_pose_dump.csv", std::ios::app);
+                    if(pf.tellp() == 0)
+                        pf << "fid,cam,t,r00,r01,r02,r10,r11,r12,r20,r21,r22,tx,ty,tz\n";
+                    for(int c = 0; c < 2; c++){
+                        const Sophus::SE3f Tc = c == 1 ? T_c1 * Tcw_cur : Tcw_cur;
+                        const Eigen::Matrix3f R = Tc.rotationMatrix();
+                        const Eigen::Vector3f t = Tc.translation();
+                        pf << mCurrentFrame.mnId << "," << c << ","
+                           << std::setprecision(9) << std::fixed
+                           << mCurrentFrame.mTimeStamp << std::setprecision(6);
+                        for(int r = 0; r < 3; r++) for(int cc = 0; cc < 3; cc++) pf << "," << R(r,cc);
+                        pf << "," << t(0) << "," << t(1) << "," << t(2) << "\n";
+                    }
+                }
+                for(size_t i = 0; i < mCurrentFrame.mvLines.size(); ++i)
+                {
+                    const LineObs &lo = mCurrentFrame.mvLines[i];
+                    MapLine* pL = lo.pML;
+                    if(!pL || pL->isBad() || !pL->mbHasExtent) continue;
+                    const Sophus::SE3f Tc = lo.cam == 1 ? T_c1 * Tcw_cur : Tcw_cur;
+                    const Eigen::Matrix3f Rr = Tc.rotationMatrix();
+                    const Eigen::Vector3f tt = Tc.translation();
+                    const Eigen::Vector3f e1c = Rr * pL->mEnd1 + tt;
+                    const Eigen::Vector3f e2c = Rr * pL->mEnd2 + tt;
+                    const float r1 = pL->AngularError(Rr, tt, lo.b1u);
+                    const float r2 = pL->AngularError(Rr, tt, lo.b2u);
+                    mLineDumpFile << mCurrentFrame.mnId << "," << lo.cam << ","
+                        << pL->mnId << "," << pL->mnValidated << ","
+                        << lo.p1.x << "," << lo.p1.y << "," << lo.p2.x << "," << lo.p2.y << ","
+                        << e1c(0) << "," << e1c(1) << "," << e1c(2) << ","
+                        << e2c(0) << "," << e2c(1) << "," << e2c(2) << ","
+                        << 180.f/float(M_PI)*r1 << "," << 180.f/float(M_PI)*r2 << "\n";
+                }
+            }
         }
 
         mvPrevLines = mCurrentFrame.mvLines;

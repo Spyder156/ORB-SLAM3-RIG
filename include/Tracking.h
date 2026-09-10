@@ -40,6 +40,7 @@
 
 #include "GeometricCamera.h"
 
+#include <fstream>
 #include <mutex>
 #include <unordered_set>
 
@@ -288,6 +289,20 @@ protected:
     long audTriStale = 0, audTriTot2 = 0;
     /// Max angular residual for REUSING an existing MapLine (~1.1 deg).
     float mfLineReobsMaxRad = 0.02f;
+
+    /// Map->frame line re-acquisition (SearchByProjection for lines):
+    /// recently-seen line landmarks propose themselves to unbound segments
+    /// every frame, so a track survives missed frames and fragmentation the
+    /// way point tracks do. Lines.reacq in the settings file (default on).
+    bool mbLineReacq = true;
+    std::vector<MapLine*> mvpLineReacqPool;   ///< landmarks seen in the last 90 frames
+    long mnLineReacq = 0;                     ///< total re-acquired bindings
+    long audReacq = 0;                        ///< per-audit-window counter
+
+    /// Per-observation debug dump (Lines.dumpFrom / Lines.dumpTo). Off (-1)
+    /// unless the settings file asks for it.
+    long mnLineDumpFrom = -1, mnLineDumpTo = -1;
+    std::ofstream mLineDumpFile;
 
     /// Minimum inliers before a visual update may override IMU propagation
     /// while RECENTLY_LOST. Upstream hardcodes 10.

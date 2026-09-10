@@ -39,6 +39,10 @@ struct LineObs {
     // Triangulating against the anchor rather than the previous frame is what
     // gives the two interpretation planes enough angle to intersect.
     bool hasAnchor = false;
+    /// How many consecutive frames this track has survived. PL-VINS refuses to
+    /// triangulate a line until LINE_MIN_OBS (5) frames have seen it -- a
+    /// 2-frame line carries no usable depth however good its parallax looks.
+    int nSeen = 1;
     int anchorMapVersion = -1;   ///< Map::GetMapChangeIndex() when anchored
     Eigen::Vector3f nAnchor = Eigen::Vector3f::Zero();
     Eigen::Matrix3f RAnchor = Eigen::Matrix3f::Identity();
