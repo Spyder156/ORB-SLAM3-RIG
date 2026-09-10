@@ -44,6 +44,7 @@ namespace ORB_SLAM3
 
 class Map;
 class MapPoint;
+class MapLine;
 class Frame;
 class KeyFrameDatabase;
 
@@ -512,6 +513,16 @@ public:
 
     //KeyPoints in the right image (for stereo fisheye, coordinates are needed)
     const std::vector<cv::KeyPoint> mvKeysRight;
+
+    // Spherical line observations, frozen from the Frame at construction --
+    // the keyframe-level record that lets Local BA refine MapLines from ALL
+    // their observations, exactly as mvKeys/mvpMapPoints do for points.
+    // mvLines[i].b1u/.b2u: UNIT bearings in the OBSERVING lens frame
+    // (lens index in LineObs::cam); mvpMapLines runs parallel to mvLines.
+    std::vector<LineObs> mvLines;
+    std::vector<MapLine*> mvpMapLines;
+    // Null every slot bound to pML (the line-side EraseMapPointMatch).
+    void EraseMapLineMatch(MapLine* pML);
 
     const int NLeft, NRight;
 

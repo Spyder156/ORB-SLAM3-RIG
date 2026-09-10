@@ -31,6 +31,17 @@ void Map::AddMapLine(MapLine* pML)
     mvpMapLines.push_back(pML);
 }
 
+void Map::EraseMapLine(MapLine* pML)
+{
+    unique_lock<mutex> lock(mMutexMapLines);
+    for(size_t i=0;i<mvpMapLines.size();i++)
+        if(mvpMapLines[i]==pML){
+            mvpMapLines[i]=mvpMapLines.back();
+            mvpMapLines.pop_back();
+            break;
+        }
+}
+
 std::vector<MapLine*> Map::GetAllMapLines()
 {
     unique_lock<mutex> lock(mMutexMapLines);

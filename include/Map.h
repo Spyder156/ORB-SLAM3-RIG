@@ -76,6 +76,7 @@ public:
     /// ~790k leaked over a single run. Registering them here is the
     /// prerequisite for dumping them and, later, for culling them.
     void AddMapLine(MapLine* pML);
+    void EraseMapLine(MapLine* pML);
     std::vector<MapLine*> GetAllMapLines();
 
     /// Bumped ONLY when the whole world frame is re-expressed

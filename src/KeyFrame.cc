@@ -19,6 +19,7 @@
 #include "KeyFrame.h"
 #include "Converter.h"
 #include "ImuTypes.h"
+#include "MapLine.h"
 #include<mutex>
 
 namespace ORB_SLAM3
@@ -91,6 +92,12 @@ KeyFrame::KeyFrame(Frame &F, Map *pMap, KeyFrameDatabase *pKFDB):
 
     mImuBias = F.mImuBias;
     SetPose(F.GetPose());
+
+    // Freeze the frame's line observations (bearings are in the observing
+    // lens frame, pose-independent -- safe to copy by value). The bound
+    // MapLine set is the post-pose-optimization state of this frame.
+    mvLines = F.mvLines;
+    mvpMapLines = F.mvpMapLines;
 
     mnOriginMapId = pMap->GetId();
 }
@@ -316,6 +323,16 @@ void KeyFrame::EraseMapPointMatch(MapPoint* pMP)
         mvpMapPoints[rightIndex]=static_cast<MapPoint*>(NULL);
 }
 
+
+void KeyFrame::EraseMapLineMatch(MapLine* pML)
+{
+    // MapLine keeps ONE index per KF; null that slot. (Unlike points there is
+    // no left/right split -- the lens index lives inside LineObs.)
+    unique_lock<mutex> lock(mMutexFeatures);
+    for(size_t i=0; i<mvpMapLines.size(); i++)
+        if(mvpMapLines[i]==pML)
+            mvpMapLines[i]=static_cast<MapLine*>(NULL);
+}
 
 void KeyFrame::ReplaceMapPointMatch(const int &idx, MapPoint* pMP)
 {
@@ -595,6 +612,16 @@ void KeyFrame::SetBadFlag()
         if(mvpMapPoints[i])
         {
             mvpMapPoints[i]->EraseObservation(this);
+        }
+    }
+
+    // Lines get the same goodbye as points: a culled keyframe must not stay
+    // in any MapLine's observation map (BA would dereference a dead KF).
+    for(size_t i=0; i<mvpMapLines.size(); i++)
+    {
+        if(mvpMapLines[i])
+        {
+            mvpMapLines[i]->EraseObservation(this);
         }
     }
 
