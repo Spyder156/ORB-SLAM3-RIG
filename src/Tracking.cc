@@ -2038,17 +2038,10 @@ Sophus::SE3f Tracking::GrabImageMonoRig(const cv::Mat &im0, const cv::Mat &im1,
                     audParallax += std::asin(std::min(1.f, n1w.cross(n2w).norm()));
                     audNTri++;
                 }
-                // PL-VINS `LINE_MIN_OBS = 5`: a track must be seen by five
-                // frames before it is allowed to become a landmark. Two views
-                // can show good plane parallax and still carry no usable depth.
-                if(cur.nSeen < 5) continue;
-
                 Eigen::Vector3f dw, mw;
-                // parallax gate 3.6 deg (PL-VINS `min_cos_theta > 0.998`),
-                // was 2.0 deg here.
                 if(!MapLine::Triangulate(cur.n, Tc.rotationMatrix(), Tc.translation(),
                                          cur.nAnchor, cur.RAnchor, cur.tAnchor,
-                                         3.6f, dw, mw))
+                                         2.0f, dw, mw))
                     continue;      // still too little angle -- keep accumulating
 
                 {   // DIRECTION GATE. The residual n.b constrains only the
