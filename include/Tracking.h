@@ -289,6 +289,10 @@ protected:
     long audTriStale = 0, audTriTot2 = 0;
     /// Max angular residual for REUSING an existing MapLine (~1.1 deg).
     float mfLineReobsMaxRad = 0.02f;
+    /// Minimum anchor-to-current translation before a line may be triangulated
+    /// [m]. Lines.minBaseline in the settings file. At the 2 deg parallax floor
+    /// the reachable depth is about baseline/tan(2 deg) = 28x this value.
+    float mfLineMinBaseline = 0.20f;
 
     /// Map->frame line re-acquisition (SearchByProjection for lines):
     /// recently-seen line landmarks propose themselves to unbound segments

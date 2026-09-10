@@ -77,6 +77,9 @@ public:
     float mMinAngLen, mMaxAngLen;   ///< [rad]
     float mGateNormal, mGateDir;    ///< [rad]
     float mGateLenRatio;
+    /// Minimum fraction of the SHORTER segment that must overlap the other,
+    /// measured as arc along their shared great circle (LF-PGVIO uses 0.5).
+    float mGateOverlap = 0.5f;
     int mGradThresh, mMinLenPx;
 };
 

@@ -104,11 +104,37 @@ std::vector<int> LineExtractor::Match(const std::vector<LineObs>& cur,
             // sign-free: a line has no orientation, so |n_i . n_j|
             const float an = std::fabs(cur[i].n.dot(prev[j].n));
             if (an < cN) continue;
-            const float ad = std::fabs(cur[i].dir.dot(prev[j].dir));
-            if (ad < cD) continue;
-            const float lo = std::min(cur[i].angLen, prev[j].angLen);
-            const float hi = std::max(cur[i].angLen, prev[j].angLen);
-            if (hi < 1e-9f || lo / hi < mGateLenRatio) continue;
+            // ANGULAR OVERLAP on the shared great circle (LF-PGVIO), not a
+            // length ratio. Two DIFFERENT physical edges lying on the same
+            // circle -- the parallel-neighbour failure -- have similar lengths
+            // and pass a ratio test; they do not overlap. The old chord gate
+            // |dir_i.dir_j| is dropped: the chord is the circle's tangent at
+            // the segment MIDPOINT, so it tested where the segment sat on the
+            // circle rather than whether it was the same line.
+            {
+                const Eigen::Vector3f n = cur[i].n;
+                // in-plane frame centred on this segment
+                Eigen::Vector3f u = cur[i].b1u - n * n.dot(cur[i].b1u);
+                if (u.norm() < 1e-6f) continue;
+                u.normalize();
+                const Eigen::Vector3f v = n.cross(u);
+                auto ang = [&](const Eigen::Vector3f& b) {
+                    return std::atan2(b.dot(v), b.dot(u));
+                };
+                float a1 = ang(cur[i].b1u),  a2 = ang(cur[i].b2u);
+                float a3 = ang(prev[j].b1u), a4 = ang(prev[j].b2u);
+                if (a1 > a2) std::swap(a1, a2);
+                if (a3 > a4) std::swap(a3, a4);
+                // segments are <40 deg, so a straddle of +-pi means wraparound
+                const float TWO_PI = 2.f * float(M_PI);
+                if (a2 - a1 > float(M_PI)) { const float t = a1; a1 = a2; a2 = t + TWO_PI; }
+                if (a4 - a3 > float(M_PI)) { const float t = a3; a3 = a4; a4 = t + TWO_PI; }
+                const float len1 = a2 - a1, len2 = a4 - a3;
+                if (len1 < 1e-6f || len2 < 1e-6f) continue;
+                const float ov = std::min(a2, a4) - std::max(a1, a3);
+                if (ov <= 0.f) continue;                       // disjoint pieces
+                if (ov / std::min(len1, len2) < mGateOverlap) continue;
+            }
             cands.push_back({an, int(i), int(j)});
         }
     }

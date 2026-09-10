@@ -151,6 +151,9 @@ protected:
     /// observation misses its own segment by more than ~3 px, or whose
     /// endpoints fall behind a camera / span an absurd length.
     void RemoveLineOutliers();
+    /// Re-solve each line from the WIDEST-parallax pair of its observations
+    /// (PL-VINS picks the best pair instead of the first admissible one).
+    void RetriangulateLines();
     std::list<MapLine*> mlpRecentAddedMapLines;
     void SearchInNeighbors();
     void KeyFrameCulling();

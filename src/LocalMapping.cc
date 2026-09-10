@@ -32,8 +32,8 @@
 namespace ORB_SLAM3
 {
 
-bool LocalMapping::skLineOutlierCull = true;
-bool LocalMapping::skLineCulling = true;
+bool LocalMapping::skLineOutlierCull = false;
+bool LocalMapping::skLineCulling = false;
 
 LocalMapping::LocalMapping(System* pSys, Atlas *pAtlas, const float bMonocular, bool bInertial, const string &_strSeqName):
     mpSystem(pSys), mbMonocular(bMonocular), mbInertial(bInertial), mbResetRequested(false), mbResetRequestedActiveMap(false), mbFinishRequested(false), mbFinished(true), mpAtlas(pAtlas), bInitializing(false),
@@ -100,6 +100,7 @@ void LocalMapping::Run()
             MapPointCulling();
             if(skLineCulling)     MapLineCulling();
             if(skLineOutlierCull) RemoveLineOutliers();
+            RetriangulateLines();
 #ifdef REGISTER_TIMES
             std::chrono::steady_clock::time_point time_EndMPCulling = std::chrono::steady_clock::now();
 
@@ -366,6 +367,90 @@ void LocalMapping::EmptyQueue()
 {
     while(CheckNewKeyFrames())
         ProcessNewKeyFrame();
+}
+
+void LocalMapping::RetriangulateLines()
+{
+    // DEPTH, not culling. A line is created the instant its parallax first
+    // clears the 2 deg floor -- the WORST admissible pair -- and then never
+    // improves, so its depth is set by the noisiest geometry it will ever see.
+    // PL-VINS instead scans every observation and triangulates from the pair
+    // with MAXIMUM parallax. Same idea here, over the keyframe observations.
+    std::vector<KeyFrame*> vKF = mpCurrentKeyFrame->GetBestCovisibilityKeyFrames(10);
+    vKF.push_back(mpCurrentKeyFrame);
+    std::set<MapLine*> sLines;
+    for(KeyFrame* pK : vKF){
+        if(!pK || pK->isBad()) continue;
+        for(MapLine* pML : pK->mvpMapLines)
+            if(pML && !pML->isBad()) sLines.insert(pML);
+    }
+
+    int nTried = 0, nImproved = 0; double gainSum = 0.0;
+    for(MapLine* pML : sLines)
+    {
+        // gather this landmark's observations, each as a world-frame plane
+        struct Ob { Eigen::Vector3f nw, nc, t; Eigen::Matrix3f R; Eigen::Vector3f b1, b2; };
+        std::vector<Ob> obs;
+        for(auto &o : pML->GetObservations())
+        {
+            KeyFrame* pK = o.first; const int idx = o.second;
+            if(!pK || pK->isBad() || idx < 0 || idx >= (int)pK->mvLines.size()) continue;
+            const LineObs &lo = pK->mvLines[idx];
+            Sophus::SE3f Tc = pK->GetPose();
+            if(lo.cam == 1 && pK->mpCamera2) Tc = pK->GetRelativePoseTrl() * Tc;
+            Ob ob; ob.R = Tc.rotationMatrix(); ob.t = Tc.translation();
+            ob.nc = lo.n; ob.nw = ob.R.transpose() * lo.n;
+            ob.b1 = lo.b1u; ob.b2 = lo.b2u;
+            obs.push_back(ob);
+        }
+        if(obs.size() < 2) continue;
+        nTried++;
+
+        // WIDEST pair of interpretation planes
+        int bi = -1, bj = -1; float best = 0.f;
+        for(size_t i = 0; i < obs.size(); i++)
+            for(size_t j = i + 1; j < obs.size(); j++){
+                const float s = std::min(1.f, obs[i].nw.cross(obs[j].nw).norm());
+                const float a = std::asin(s);
+                if(a > best){ best = a; bi = (int)i; bj = (int)j; }
+            }
+        if(bi < 0) continue;
+        // only bother when it genuinely beats what the landmark was built from
+        if(best < 1.2f * pML->mCreateParallax) continue;
+
+        Eigen::Vector3f dw, mw;
+        if(!MapLine::Triangulate(obs[bi].nc, obs[bi].R, obs[bi].t,
+                                 obs[bj].nc, obs[bj].R, obs[bj].t,
+                                 2.0f, dw, mw)) continue;
+
+        // must still explain BOTH source observations at positive depth
+        bool ok = true;
+        for(int k : {bi, bj}){
+            const Eigen::Vector3f d_c = obs[k].R * dw;
+            const Eigen::Vector3f m_c = obs[k].R * mw + obs[k].t.cross(d_c);
+            for(const Eigen::Vector3f& b : {obs[k].b1, obs[k].b2}){
+                const Eigen::Vector3f cr = b.cross(d_c);
+                const float den = cr.squaredNorm();
+                if(den < 1e-10f || m_c.dot(cr)/den <= 0.05f){ ok = false; break; }
+            }
+            if(!ok) break;
+        }
+        if(!ok) continue;
+
+        const float oldPar = pML->mCreateParallax;
+        pML->SetPlucker(dw, mw);              // slides the extent onto the new line
+        pML->mCreateParallax = best;
+        // re-derive the extent from the widest pair's observations
+        pML->mbHasExtent = false;
+        for(int k : {bi, bj})
+            pML->SetExtentFromBearings(obs[k].R, obs[k].t, obs[k].b1, obs[k].b2);
+        nImproved++; gainSum += 180.0/M_PI*(best - oldPar);
+    }
+    static long nq = 0;
+    if(++nq % 20 == 0 && nTried)
+        std::cout << "[AUDIT] RetriangulateLines: " << nImproved << "/" << nTried
+                  << " re-solved on a wider pair, mean parallax gain "
+                  << (nImproved ? gainSum/nImproved : 0.0) << " deg" << std::endl;
 }
 
 void LocalMapping::RemoveLineOutliers()

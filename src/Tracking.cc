@@ -656,6 +656,8 @@ void Tracking::newParameterLoader(Settings *settings) {
             const int   gth  = lfs["Lines.gradThresh"].empty()   ? 30    : (int)lfs["Lines.gradThresh"];
             const int   mpx  = lfs["Lines.minLenPx"].empty()     ? 15    : (int)lfs["Lines.minLenPx"];
             mbLineReacq = lfs["Lines.reacq"].empty() || (int)lfs["Lines.reacq"] != 0;
+            if(!lfs["Lines.minBaseline"].empty())
+                mfLineMinBaseline = (float)lfs["Lines.minBaseline"];
             LocalMapping::skLineOutlierCull =
                 lfs["Lines.outlierCull"].empty() || (int)lfs["Lines.outlierCull"] != 0;
             LocalMapping::skLineCulling =
@@ -2042,6 +2044,24 @@ Sophus::SE3f Tracking::GrabImageMonoRig(const cv::Mat &im0, const cv::Mat &im1,
                     audParallax += std::asin(std::min(1.f, n1w.cross(n2w).norm()));
                     audNTri++;
                 }
+                {   // MINIMUM BASELINE, not just minimum angle.
+                    // Plane parallax ~ baseline/depth, so triggering at the
+                    // first moment parallax clears 2 deg means the landmark is
+                    // born at depth ~ baseline/tan(2 deg) ~ 28x baseline. With
+                    // the few-centimetre baseline of a young track that pins
+                    // every line at about a metre no matter how far away it
+                    // really is -- measured: lines sit at 0.81 m from the
+                    // camera path where points sit at 1.56 m, and 49 px
+                    // segments come out 11 cm long. Far lines cannot clear the
+                    // angle gate at a short baseline at all; the ones that do
+                    // clear it on noise and get a near depth.
+                    // Require real translation so the admissible depth range
+                    // actually reaches across the room.
+                    const Eigen::Vector3f Ccur = -Tc.rotationMatrix().transpose() * Tc.translation();
+                    const Eigen::Vector3f Canc = -cur.RAnchor.transpose() * cur.tAnchor;
+                    if((Ccur - Canc).norm() < mfLineMinBaseline) continue;
+                }
+
                 Eigen::Vector3f dw, mw;
                 if(!MapLine::Triangulate(cur.n, Tc.rotationMatrix(), Tc.translation(),
                                          cur.nAnchor, cur.RAnchor, cur.tAnchor,
