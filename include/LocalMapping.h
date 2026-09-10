@@ -33,6 +33,8 @@
 namespace ORB_SLAM3
 {
 
+class MapLine;
+
 class System;
 class Tracking;
 class LoopClosing;
@@ -136,6 +138,15 @@ protected:
     void CreateNewMapPoints();
 
     void MapPointCulling();
+    /// Line analogue of MapPointCulling (PLVS LocalMapping::MapLineCulling).
+    /// Without it a bad line landmark lives forever: it keeps being drawn,
+    /// keeps entering BA and keeps voting on the pose.
+    void MapLineCulling();
+    /// PL-VINS `removeLineOutlier`: delete any line landmark whose WORST
+    /// observation misses its own segment by more than ~3 px, or whose
+    /// endpoints fall behind a camera / span an absurd length.
+    void RemoveLineOutliers();
+    std::list<MapLine*> mlpRecentAddedMapLines;
     void SearchInNeighbors();
     void KeyFrameCulling();
 

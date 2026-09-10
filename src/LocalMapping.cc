@@ -18,6 +18,7 @@
 
 
 #include "LocalMapping.h"
+#include "MapLine.h"
 #include "Rig.h"
 #include "LoopClosing.h"
 #include "ORBmatcher.h"
@@ -94,6 +95,8 @@ void LocalMapping::Run()
 
             // Check recent MapPoints
             MapPointCulling();
+            MapLineCulling();
+            RemoveLineOutliers();
 #ifdef REGISTER_TIMES
             std::chrono::steady_clock::time_point time_EndMPCulling = std::chrono::steady_clock::now();
 
@@ -334,6 +337,21 @@ void LocalMapping::ProcessNewKeyFrame()
         }
     }
 
+    // Associate MapLines to the new keyframe -- the line analogue of the
+    // point loop above. This is what makes a line's observation list grow
+    // beyond the 2 planes that created it, so Local BA can refine it from
+    // ALL sightings (points parity).
+    for(size_t i=0; i<mpCurrentKeyFrame->mvpMapLines.size(); i++)
+    {
+        MapLine* pML = mpCurrentKeyFrame->mvpMapLines[i];
+        if(!pML || pML->isBad()) continue;
+        pML->AddObservation(mpCurrentKeyFrame, i);
+        if(pML->mnFirstKFid < 0){          // first keyframe this line reached
+            pML->mnFirstKFid = (long)mpCurrentKeyFrame->mnId;
+            mlpRecentAddedMapLines.push_back(pML);
+        }
+    }
+
     // Update links in the Covisibility Graph
     mpCurrentKeyFrame->UpdateConnections();
 
@@ -345,6 +363,115 @@ void LocalMapping::EmptyQueue()
 {
     while(CheckNewKeyFrames())
         ProcessNewKeyFrame();
+}
+
+void LocalMapping::RemoveLineOutliers()
+{
+    // PL-VINS removes a line outright when its MAXIMUM reprojection error over
+    // ALL its observations exceeds 3.0/500 in normalised coords (~3 px). We
+    // measured ~39% of our landmarks missing their segment in EVERY keyframe
+    // that sees them -- nothing removed them, so they kept being drawn, kept
+    // entering BA and kept voting. Same rule, spherical residual.
+    const float kMaxErrPx = 3.0f;
+    const float kMaxLen3D = 10.0f;
+
+    // Sliding-window scope: the current keyframe and its covisible neighbours,
+    // rather than the whole map (PL-VINS runs over its estimator window).
+    std::vector<KeyFrame*> vKF = mpCurrentKeyFrame->GetBestCovisibilityKeyFrames(10);
+    vKF.push_back(mpCurrentKeyFrame);
+    std::set<MapLine*> sLines;
+    for(KeyFrame* pK : vKF){
+        if(!pK || pK->isBad()) continue;
+        for(MapLine* pML : pK->mvpMapLines)
+            if(pML && !pML->isBad()) sLines.insert(pML);
+    }
+
+    int nBadErr = 0, nBadCheir = 0, nBadLen = 0;
+    for(MapLine* pML : sLines)
+    {
+        Eigen::Vector3f S, E; pML->GetEndpoints(S, E);
+        if(!pML->mbHasExtent) continue;
+        if((E - S).norm() > kMaxLen3D){ pML->SetBadFlag(); nBadLen++; continue; }
+
+        float worst = 0.f; bool behind = false; int nUsed = 0;
+        for(auto &ob : pML->GetObservations())
+        {
+            KeyFrame* pK = ob.first;
+            const int idx = ob.second;
+            if(!pK || pK->isBad()) continue;
+            if(idx < 0 || idx >= (int)pK->mvLines.size()) continue;
+            const LineObs &lo = pK->mvLines[idx];
+            Sophus::SE3f Tc = pK->GetPose();
+            if(lo.cam == 1 && pK->mpCamera2) Tc = pK->GetRelativePoseTrl() * Tc;
+            const Eigen::Matrix3f R = Tc.rotationMatrix();
+            const Eigen::Vector3f t = Tc.translation();
+            const float f = pK->mpCamera ? pK->mpCamera->getParameter(0) : 400.f;
+            for(const Eigen::Vector3f& X : {S, E})
+            {
+                const Eigen::Vector3f Xc = R * X + t;
+                if(Xc(2) <= 0.05f){ behind = true; break; }
+                const float r = Xc.norm();
+                if(r < 1e-6f){ behind = true; break; }
+                // angular distance of this endpoint from the OBSERVED great
+                // circle, in pixels -- the same residual the edges minimise
+                const float e = std::asin(std::min(1.f,
+                                   std::fabs(lo.n.dot(Xc / r)))) * f;
+                worst = std::max(worst, e);
+            }
+            if(behind) break;
+            nUsed++;
+        }
+        if(behind){ pML->SetBadFlag(); nBadCheir++; continue; }
+        if(nUsed >= 2 && worst > kMaxErrPx){ pML->SetBadFlag(); nBadErr++; }
+    }
+    static long nr = 0;
+    if(++nr % 20 == 0)
+        std::cout << "[AUDIT] RemoveLineOutliers: checked " << sLines.size()
+                  << ", deleted " << nBadErr << " (worst reproj > " << kMaxErrPx
+                  << " px) + " << nBadCheir << " (behind camera) + " << nBadLen
+                  << " (too long)" << std::endl;
+}
+
+void LocalMapping::MapLineCulling()
+{
+    // Same probation points get: a young landmark must prove it is re-found
+    // often enough and picked up by enough keyframes, or it is deleted.
+    // Thresholds follow PLVS (found ratio 0.25, >=2 observations for monocular).
+    std::list<MapLine*>::iterator lit = mlpRecentAddedMapLines.begin();
+    const long nCurrentKFid = (long)mpCurrentKeyFrame->mnId;
+    const int nThObs = 2;                       // monocular rig
+    int nCulledRatio = 0, nCulledObs = 0, nGraduated = 0;
+    while(lit != mlpRecentAddedMapLines.end())
+    {
+        MapLine* pML = *lit;
+        if(!pML || pML->isBad())
+            lit = mlpRecentAddedMapLines.erase(lit);
+        else if(pML->GetFoundRatio() < 0.25f)
+        {   // predicted into many frames, bound in few -> it is not there
+            pML->SetBadFlag();
+            lit = mlpRecentAddedMapLines.erase(lit);
+            nCulledRatio++;
+        }
+        else if((nCurrentKFid - pML->mnFirstKFid) >= 2 && pML->Observations() <= nThObs)
+        {   // two keyframes of grace, then it must be carrying observations
+            pML->SetBadFlag();
+            lit = mlpRecentAddedMapLines.erase(lit);
+            nCulledObs++;
+        }
+        else if((nCurrentKFid - pML->mnFirstKFid) >= 3)
+        {   // survived probation -- stop watching it
+            lit = mlpRecentAddedMapLines.erase(lit);
+            nGraduated++;
+        }
+        else
+            lit++;
+    }
+    static long nc = 0;
+    if(++nc % 20 == 0)
+        std::cout << "[AUDIT] MapLineCulling: killed " << nCulledRatio
+                  << " (found-ratio) + " << nCulledObs << " (too few obs), graduated "
+                  << nGraduated << ", watching " << mlpRecentAddedMapLines.size()
+                  << std::endl;
 }
 
 void LocalMapping::MapPointCulling()
