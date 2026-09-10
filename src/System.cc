@@ -799,7 +799,7 @@ void System::SaveMapPoints(const string &filename)
     // direct test of whether the geometry is right -- cam0 points should sit
     // AHEAD of the camera and cam1 points BEHIND it.
     //   0 = front only, 1 = rear only, 2 = both cameras observed it
-    f << fixed << "t,x,y,z,cam" << endl;
+    f << fixed << "t,x,y,z,cam,id" << endl;
     int n = 0, nbad = 0, n0 = 0, n1 = 0, nboth = 0;
     for(MapPoint* pMP : pBiggerMap->GetAllMapPoints())
     {
@@ -824,7 +824,7 @@ void System::SaveMapPoints(const string &filename)
 
         f << setprecision(9) << t << ","
           << setprecision(6) << P(0) << "," << P(1) << "," << P(2) << ","
-          << cam << endl;
+          << cam << "," << pMP->mnId << endl;
         n++;
     }
     cout << "  by camera: front-only " << n0 << ", rear-only " << n1
@@ -854,7 +854,7 @@ void System::SaveMapLines(const string &filename)
     const Sophus::SE3f Tb0w = Twb0.inverse();
 
     ofstream f(filename);
-    f << fixed << "t,x1,y1,z1,x2,y2,z2" << endl;
+    f << fixed << "t,x1,y1,z1,x2,y2,z2,validated,id" << endl;
     long n = 0, noext = 0;
     for(MapLine* pML : pBiggerMap->GetAllMapLines())
     {
@@ -880,12 +880,147 @@ void System::SaveMapLines(const string &filename)
         if(KeyFrame* pRef = pML->GetReferenceKeyFrame()) t = pRef->mTimeStamp;
         f << setprecision(9) << t << "," << setprecision(6)
           << e1(0) << "," << e1(1) << "," << e1(2) << ","
-          << e2(0) << "," << e2(1) << "," << e2(2) << endl;
+          << e2(0) << "," << e2(1) << "," << e2(2) << ","
+          << pML->mnValidated << "," << pML->mnId << endl;
         n++;
     }
     f.close();
+
+    {   // GROUND TRUTH FOR OFFLINE ANALYSIS, all at FINAL state and all in the
+        // SAME b0 frame as the map above. Two files:
+        //   kf_pose_b0.csv  T_c_b0 per keyframe per lens (b0 world -> lens),
+        //                   computed here by the estimator's own composition.
+        //   kf_line_obs.csv the segments that keyframe actually observed, with
+        //                   the landmark id each is bound to.
+        // Projecting a map line (by id) with the matching T_c_b0 must land on
+        // its segment. Any offline reconstruction of T_c_b0 can be diffed
+        // against this instead of assumed correct.
+        const Sophus::SE3f Twb0_ = Tb0w.inverse();
+        ofstream pf(filename.substr(0, filename.find_last_of('.')) + "_kfpose_b0.csv");
+        ofstream of(filename.substr(0, filename.find_last_of('.')) + "_kfobs.csv");
+        pf << fixed << "kfid,t,cam,r00,r01,r02,r10,r11,r12,r20,r21,r22,tx,ty,tz\n";
+        of << fixed << "kfid,t,cam,lineid,x1,y1,x2,y2\n";
+        ofstream pof(filename.substr(0, filename.find_last_of('.')) + "_kfpts.csv");
+        pof << fixed << "kfid,t,cam,pointid,u,v\n";
+        const Sophus::SE3f T_c1_c0 = mRig.IsEnabled() ? mRig.T_c1_c0() : Sophus::SE3f();
+        for(KeyFrame* pKF : vpKFsOrd)
+        {
+            if(!pKF || pKF->isBad()) continue;
+            const Sophus::SE3f Tcw_raw = pKF->GetPose();          // raw world -> cam0
+            for(int c = 0; c < 2; c++)
+            {
+                const Sophus::SE3f Tc = (c == 1 ? T_c1_c0 * Tcw_raw : Tcw_raw) * Twb0_;
+                const Eigen::Matrix3f R = Tc.rotationMatrix();
+                const Eigen::Vector3f t = Tc.translation();
+                pf << pKF->mnId << "," << setprecision(9) << pKF->mTimeStamp
+                   << "," << c << setprecision(6);
+                for(int r = 0; r < 3; r++) for(int cc = 0; cc < 3; cc++) pf << "," << R(r,cc);
+                pf << "," << t(0) << "," << t(1) << "," << t(2) << "\n";
+            }
+            for(size_t i = 0; i < pKF->mvLines.size() && i < pKF->mvpMapLines.size(); i++)
+            {
+                MapLine* pML = pKF->mvpMapLines[i];
+                if(!pML || pML->isBad()) continue;
+                const LineObs &lo = pKF->mvLines[i];
+                of << pKF->mnId << "," << setprecision(9) << pKF->mTimeStamp << ","
+                   << lo.cam << "," << pML->mnId << setprecision(3) << ","
+                   << lo.p1.x << "," << lo.p1.y << "," << lo.p2.x << "," << lo.p2.y << "\n";
+            }
+            // THE REFERENCE PATH: the same thing for POINTS. Points are known
+            // to behave; measuring them through the identical keyframe, pose
+            // and projection turns "lines look wrong" into a bisect.
+            {
+                const vector<MapPoint*> vpMP = pKF->GetMapPointMatches();
+                for(size_t i = 0; i < vpMP.size(); i++)
+                {
+                    MapPoint* pMP = vpMP[i];
+                    if(!pMP || pMP->isBad()) continue;
+                    const bool right = (pKF->NLeft != -1 && (int)i >= pKF->NLeft);
+                    if(right && (int)(i - pKF->NLeft) >= (int)pKF->mvKeysRight.size()) continue;
+                    if(!right && i >= pKF->mvKeysUn.size()) continue;
+                    const cv::KeyPoint &kp = right ? pKF->mvKeysRight[i - pKF->NLeft]
+                                                   : pKF->mvKeysUn[i];
+                    pof << pKF->mnId << "," << setprecision(9) << pKF->mTimeStamp << ","
+                        << (right ? 1 : 0) << "," << pMP->mnId << setprecision(3) << ","
+                        << kp.pt.x << "," << kp.pt.y << "\n";
+                }
+            }
+        }
+    }
+
     if(noext) cout << "  skipped " << noext << " lines with no observed extent" << endl;
+    {
+        const long acc = MapLine::nAccepted, par = MapLine::nRejParallel,
+                   dep = MapLine::nRejDepth, rat = MapLine::nRejRatio,
+                   lng = MapLine::nRejLong;
+        const long tot = acc + par + dep + rat + lng;
+        if(tot) cout << "  extent gates: accepted " << 100.0*acc/tot << "%  |"
+                     << " near-parallel(8deg) " << 100.0*par/tot << "%  "
+                     << " depth-range " << 100.0*dep/tot << "%  "
+                     << " endpoint-depth-ratio>5 " << 100.0*rat/tot << "%  "
+                     << " longer-than-20m " << 100.0*lng/tot << "%" << endl;
+    }
     cout << "  wrote " << n << " map lines" << endl;
+    {   // Per-line diagnostics for the depth-correction question: does a
+        // PERSISTENT line ever get its depth re-solved, or does it keep its
+        // 2-deg birth geometry while happily re-binding on the plane gate?
+        // Columns: id, validated sightings, creation parallax [deg], number
+        // of KF observations, widest parallax available between any two of
+        // its KF observation planes [deg] (0 if <2 KFs).
+        ofstream fs(filename.substr(0, filename.find_last_of('.')) + "_stats.csv");
+        // extent_off: distance of the stored endpoints from the landmark's OWN
+        // line, |p x d - m| (0 if consistent). Non-zero means the extent was
+        // left behind when (d,m) moved -- the drawn segment is not on the line.
+        fs << "id,validated,create_par_deg,nkf,widest_kf_par_deg,extent_off\n";
+        for(MapLine* pML : pBiggerMap->GetAllMapLines())
+        {
+            if(!pML || pML->isBad()) continue;
+            float widest = 0.f;
+            auto obs = pML->GetObservations();
+            std::vector<Eigen::Vector3f> nw;
+            for(auto& ob : obs)
+            {
+                KeyFrame* pKFi = ob.first;
+                if(!pKFi || pKFi->isBad()) continue;
+                if(ob.second < 0 || ob.second >= (int)pKFi->mvLines.size()) continue;
+                const LineObs& lo = pKFi->mvLines[ob.second];
+                // plane normal in world: R_wc * n_c (lens pose = body here is
+                // WRONG for cam1... use cam0-only stat; rear lines report 0)
+                if(lo.cam != 0) continue;
+                Sophus::SE3f Tcw = pKFi->GetPose();
+                nw.push_back(Tcw.rotationMatrix().transpose() * lo.n);
+            }
+            for(size_t i2 = 0; i2 < nw.size(); i2++)
+                for(size_t j2 = i2+1; j2 < nw.size(); j2++)
+                    widest = std::max(widest,
+                        std::asin(std::min(1.f, nw[i2].cross(nw[j2]).norm())));
+            float eoff = -1.f;
+            if(pML->mbHasExtent){
+                const Eigen::Vector3f dd = pML->GetDirection(), mm = pML->GetMoment();
+                eoff = std::max((pML->mEnd1.cross(dd) - mm).norm(),
+                                (pML->mEnd2.cross(dd) - mm).norm());
+            }
+            fs << pML->mnId << "," << pML->mnValidated << ","
+               << 180.0/M_PI*pML->mCreateParallax << "," << obs.size() << ","
+               << 180.0/M_PI*widest << "," << eoff << "\n";
+        }
+        fs.close();
+    }
+    {   // Track-length metric (the starvation number): validated sightings
+        // per landmark, over ALL landmarks ever created. Median 2.3 = starved.
+        std::vector<int> v;
+        for(MapLine* pML : pBiggerMap->GetAllMapLines())
+            if(pML && !pML->isBad()) v.push_back(pML->mnValidated);
+        if(!v.empty()){
+            std::sort(v.begin(), v.end());
+            double mean = 0; for(int x : v) mean += x; mean /= v.size();
+            cout << "  line track length (validated sightings): median "
+                 << v[v.size()/2] << "  mean " << mean
+                 << "  p90 " << v[(size_t)(0.9*v.size())]
+                 << "  landmarks alive " << v.size()
+                 << "  ever created " << MapLine::nNextId << endl;
+        }
+    }
 }
 
 void System::SaveTrajectoryEuRoC(const string &filename)
