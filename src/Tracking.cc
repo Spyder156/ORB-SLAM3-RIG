@@ -656,6 +656,9 @@ void Tracking::newParameterLoader(Settings *settings) {
             const int   gth  = lfs["Lines.gradThresh"].empty()   ? 30    : (int)lfs["Lines.gradThresh"];
             const int   mpx  = lfs["Lines.minLenPx"].empty()     ? 15    : (int)lfs["Lines.minLenPx"];
             mbLineReacq = lfs["Lines.reacq"].empty() || (int)lfs["Lines.reacq"] != 0;
+            mbLinePointsOnly = !lfs["Lines.pointsOnly"].empty() && (int)lfs["Lines.pointsOnly"] != 0;
+            if(!lfs["Lines.viewAngleMinSinSq"].empty())
+                MapLine::kMinSinSqViewAngle = (float)lfs["Lines.viewAngleMinSinSq"];
             if(!lfs["Lines.minBaseline"].empty())
                 mfLineMinBaseline = (float)lfs["Lines.minBaseline"];
             LocalMapping::skLineOutlierCull =
@@ -1812,7 +1815,8 @@ Sophus::SE3f Tracking::GrabImageMonoRig(const cv::Mat &im0, const cv::Mat &im1,
                       << " cam1 " << l1.size() << ")  matched " << m
                       << "  MapLines " << mnLineTriangulated
                       << " (reobs " << mnLineObs << ", rejected " << mnLineRej
-                      << ", inherited " << mnLineInherited << ")" << std::endl;
+                      << ", inherited " << mnLineInherited
+                      << ", FROM POINTS " << mnLineFromPts << ")" << std::endl;
             if(audNMatch > 0 || audNTri > 0){
                 std::cout << "[AUDIT] match: dNormal "
                           << (audNMatch? 180.0/M_PI*audNAng/audNMatch : 0)
@@ -1858,7 +1862,40 @@ Sophus::SE3f Tracking::GrabImageMonoRig(const cv::Mat &im0, const cv::Mat &im1,
             const Sophus::SE3f Tcw_cur = mCurrentFrame.GetPose();
             const Sophus::SE3f T_c1 = mpSystem->mRig.IsEnabled()
                                     ? mpSystem->mRig.T_c1_c0() : Sophus::SE3f();
-            long nNew = 0, nObs = 0, nRej = 0;
+            long nNew = 0, nObs = 0, nRej = 0, nFromPts = 0;
+            // POINTS ON THE EDGE.
+            // A line's direction from two interpretation planes is d = n1 x n2,
+            // which is pure noise when the planes nearly coincide -- the case
+            // for every edge running ALONG the walk. Measured on the map: our
+            // horizontal lines have the same direction distribution as random
+            // (24.0% vs 25.9% isotropic), while verticals come out 6x better
+            // than chance. So half the map points in directions the building
+            // does not contain.
+            // Our POINT cloud does not have this problem (4.4 cm neighbour
+            // spacing). Two tracked points lying on the edge give its direction
+            // and its depth outright, with no plane intersection at all. This
+            // is PL-VIWO's point-line association, which SPARO (2nd place) uses
+            // for exactly this reason.
+            // Table: for each lens, every triangulated MapPoint the frame
+            // holds, as a UNIT BEARING in that lens plus its world position.
+            struct LensPt { Eigen::Vector3f b, X; MapPoint* p; };
+            std::vector<LensPt> lensPts[2];
+            for(int lc = 0; lc < 2; lc++){
+                const Sophus::SE3f Tl = (lc == 1) ? T_c1 * Tcw_cur : Tcw_cur;
+                const Eigen::Matrix3f Rl = Tl.rotationMatrix();
+                const Eigen::Vector3f tl = Tl.translation();
+                lensPts[lc].reserve(mCurrentFrame.mvpMapPoints.size());
+                for(size_t q = 0; q < mCurrentFrame.mvpMapPoints.size(); q++){
+                    MapPoint* pMP = mCurrentFrame.mvpMapPoints[q];
+                    if(!pMP || pMP->isBad()) continue;
+                    if(q < mCurrentFrame.mvbOutlier.size() && mCurrentFrame.mvbOutlier[q]) continue;
+                    const Eigen::Vector3f Xw = pMP->GetWorldPos();
+                    const Eigen::Vector3f Xc = Rl * Xw + tl;
+                    const float r = Xc.norm();
+                    if(!(r > 0.05f) || Xc(2) <= 0.f) continue;   // behind this lens
+                    lensPts[lc].push_back({Xc / r, Xw, pMP});
+                }
+            }
             const std::vector<int> &a = mvLineAssign;
             for(size_t i = 0; i < a.size(); ++i)
             {
@@ -1964,7 +2001,8 @@ Sophus::SE3f Tracking::GrabImageMonoRig(const cv::Mat &im0, const cv::Mat &im1,
                             // refines it from ALL observations (points
                             // parity) -- the 2-view solve must not overwrite
                             // the BA estimate.
-                            if(pL->mbHasFirst && pL->Observations() < 2){
+                            if(pL->mbHasFirst && pL->Observations() < 2
+                               && pL->SupportCount() < 2){
                                 const Eigen::Vector3f n1w =
                                     Tc.rotationMatrix().transpose() * cur.n;
                                 const Eigen::Vector3f n2w =
@@ -2063,7 +2101,93 @@ Sophus::SE3f Tracking::GrabImageMonoRig(const cv::Mat &im0, const cv::Mat &im1,
                 }
 
                 Eigen::Vector3f dw, mw;
-                if(!MapLine::Triangulate(cur.n, Tc.rotationMatrix(), Tc.translation(),
+                bool bFromPoints = false;
+                {   // --- POINT-DERIVED LINE (preferred) ---------------------
+                    // Collect map points that lie ON this segment: within a few
+                    // pixels of its great circle AND inside its observed arc.
+                    // The pixel test uses the segment's own local image scale,
+                    // because a fixed angle is a different number of pixels at
+                    // the centre of a fisheye than at the rim.
+                    const int lc = (cur.cam == 1) ? 1 : 0;
+                    Eigen::Vector3f u = cur.b1u - cur.n * cur.n.dot(cur.b1u);
+                    if(u.norm() > 1e-6f){
+                        u.normalize();
+                        const Eigen::Vector3f v = cur.n.cross(u);
+                        auto arc = [&](const Eigen::Vector3f& b){
+                            return std::atan2(b.dot(v), b.dot(u)); };
+                        float a1 = arc(cur.b1u), a2 = arc(cur.b2u);
+                        if(a1 > a2) std::swap(a1, a2);
+                        if(a2 - a1 > float(M_PI)){ const float t = a1; a1 = a2; a2 = t + 2.f*float(M_PI); }
+                        const float margin = 0.10f * (a2 - a1);   // allow slight overhang
+                        std::vector<Eigen::Vector3f> onPts; std::vector<float> onDep;
+                        int nOn = 0;
+                        for(const auto& pb : lensPts[lc]){
+                            // perpendicular distance to the great circle, in px
+                            const float dpx = std::asin(std::min(1.f,
+                                std::fabs(cur.n.dot(pb.b)))) * cur.pxPerRad;
+                            if(dpx > mfLinePtMaxPx) continue;
+                            float t = arc(pb.b);
+                            if(t < a1 - float(M_PI)) t += 2.f*float(M_PI);
+                            if(t < a1 - margin || t > a2 + margin) continue;  // not on this piece
+                            onPts.push_back(pb.X);
+                            onDep.push_back((Tc.rotationMatrix() * pb.X + Tc.translation()).norm());
+                            nOn++;
+                        }
+                        // ROBUST FIT, not the two extremes. Points that share a
+                        // great circle need NOT be collinear in 3D: one can sit
+                        // on the near wall and another metres away through a
+                        // doorway, both on the same viewing plane. A line drawn
+                        // through that pair shoots from near to far -- exactly
+                        // the segments radiating out of the trajectory. Measured:
+                        // forcing every line to come from points made the >2 m
+                        // population WORSE (5.5% -> 8.3%), which is this bug.
+                        // So: find the largest subset of the on-circle points
+                        // that really is collinear in 3D, and require it to be
+                        // depth-consistent.
+                        if(nOn >= 2){
+                            int bi = -1, bj = -1, bestIn = 0;
+                            for(size_t q1 = 0; q1 < onPts.size(); q1++)
+                              for(size_t q2 = q1 + 1; q2 < onPts.size(); q2++){
+                                Eigen::Vector3f dc = onPts[q2] - onPts[q1];
+                                const float dn = dc.norm();
+                                if(dn < mfLinePtMinSep) continue;
+                                dc /= dn;
+                                int nin = 0;
+                                for(const auto& X : onPts)
+                                    if((X - onPts[q1]).cross(dc).norm() < mfLinePtInlier) nin++;
+                                if(nin > bestIn){ bestIn = nin; bi = int(q1); bj = int(q2); }
+                              }
+                            if(bi >= 0 && bestIn >= 2){
+                                Eigen::Vector3f d = onPts[bj] - onPts[bi];
+                                d.normalize();
+                                // depth consistency: a line running from just in
+                                // front of the lens to across the room is the
+                                // radiating artefact, not an edge
+                                float dmin = 1e9f, dmax = 0.f;
+                                for(size_t q = 0; q < onPts.size(); q++){
+                                    if((onPts[q] - onPts[bi]).cross(d).norm() >= mfLinePtInlier) continue;
+                                    const float r = onDep[q];
+                                    dmin = std::min(dmin, r); dmax = std::max(dmax, r);
+                                }
+                                if(dmax <= mfLinePtDepthRatio * dmin){
+                                    dw = d;
+                                    mw = onPts[bi].cross(d);   // moment about the origin
+                                    bFromPoints = true;
+                                }
+                            }
+                        }
+                    }
+                }
+                // TEST: when mbLinePointsOnly is set, a line may ONLY be born
+                // from points on it. The hypothesis is that the long segments
+                // radiating out of the trajectory are plane-intersection lines
+                // with bad conditioning -- the intersection runs off toward
+                // where the two planes become parallel, which is exactly a long
+                // ray pointing away from the camera. If so, refusing to create
+                // them should remove the starburst entirely.
+                if(mbLinePointsOnly && !bFromPoints){ nRej++; continue; }
+                if(!bFromPoints &&
+                   !MapLine::Triangulate(cur.n, Tc.rotationMatrix(), Tc.translation(),
                                          cur.nAnchor, cur.RAnchor, cur.tAnchor,
                                          2.0f, dw, mw))
                     continue;      // still too little angle -- keep accumulating
@@ -2078,7 +2202,7 @@ Sophus::SE3f Tracking::GrabImageMonoRig(const cv::Mat &im0, const cv::Mat &im1,
                     // >5 m long and 79% of those ran along the view ray --
                     // random directions exploding the bearing-intersection.
                     const Eigen::Vector3f d_chk = Tc.rotationMatrix() * dw;
-                    if(std::fabs(d_chk.dot(cur.dir)) < 0.9659f){  // > 15 deg off
+                    if(!bFromPoints && std::fabs(d_chk.dot(cur.dir)) < 0.9659f){  // > 15 deg off
                         nRej++;
                         continue;
                     }
@@ -2136,10 +2260,10 @@ Sophus::SE3f Tracking::GrabImageMonoRig(const cv::Mat &im0, const cv::Mat &im1,
                 mpAtlas->GetCurrentMap()->AddMapLine(pML);
                 cur.pML = pML;
                 mCurrentFrame.mvpMapLines[i] = pML;
-                nNew++;
+                nNew++; if(bFromPoints) nFromPts++;
             }
             mnLineTriangulated += nNew;
-            mnLineObs += nObs; mnLineRej += nRej;
+            mnLineObs += nObs; mnLineRej += nRej; mnLineFromPts += nFromPts;
 
             // ---- MAP->FRAME RE-ACQUISITION: SearchByProjection, for lines.
             // Every recently-seen line landmark predicts its great circle in
@@ -2249,6 +2373,38 @@ Sophus::SE3f Tracking::GrabImageMonoRig(const cv::Mat &im0, const cv::Mat &im1,
                     }
                 }
                 mnLineReacq += nReacq; audReacq += nReacq;
+            }
+
+            // ---- SUPPORT PASS: every line bound in THIS frame collects the
+            // triangulated map points lying on its observed segment, then is
+            // refit to them. Geometry from points; planes only constrain pose.
+            for(size_t i = 0; i < mCurrentFrame.mvLines.size(); ++i)
+            {
+                LineObs &cur = mCurrentFrame.mvLines[i];
+                MapLine* pL = cur.pML;
+                if(!pL || pL->isBad()) continue;
+                const int lc = (cur.cam == 1) ? 1 : 0;
+                if(lensPts[lc].empty()) continue;
+                Eigen::Vector3f u = cur.b1u - cur.n * cur.n.dot(cur.b1u);
+                if(u.norm() < 1e-6f) continue;
+                u.normalize();
+                const Eigen::Vector3f v = cur.n.cross(u);
+                auto arc = [&](const Eigen::Vector3f& b){ return std::atan2(b.dot(v), b.dot(u)); };
+                float a1 = arc(cur.b1u), a2 = arc(cur.b2u);
+                if(a1 > a2) std::swap(a1, a2);
+                if(a2 - a1 > float(M_PI)){ const float t = a1; a1 = a2; a2 = t + 2.f*float(M_PI); }
+                const float margin = 0.10f * (a2 - a1);
+                bool grew = false;
+                for(const auto& pb : lensPts[lc]){
+                    const float dpx = std::asin(std::min(1.f,
+                        std::fabs(cur.n.dot(pb.b)))) * cur.pxPerRad;
+                    if(dpx > mfLinePtMaxPx) continue;
+                    float t = arc(pb.b);
+                    if(t < a1 - float(M_PI)) t += 2.f*float(M_PI);
+                    if(t < a1 - margin || t > a2 + margin) continue;
+                    pL->AddSupportPoint(pb.p); grew = true;
+                }
+                if(grew && pL->SupportCount() >= 2) pL->RefitFromPoints();
             }
 
             // ---- pool upkeep: every landmark bound in THIS frame (carried,

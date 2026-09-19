@@ -282,7 +282,7 @@ protected:
     bool mbUseLines = false;
     std::vector<LineObs> mvPrevLines;      ///< previous frame, for tracking
     long mnLineMatches = 0, mnLineTotal = 0, mnLineTriangulated = 0;
-    long mnLineObs = 0, mnLineRej = 0, mnLineInherited = 0;
+    long mnLineObs = 0, mnLineRej = 0, mnLineInherited = 0, mnLineFromPts = 0;
     // stage-audit accumulators (Track thread only)
     double audNAng = 0, audPxMove = 0, audParallax = 0;
     long audNMatch = 0, audNTri = 0, audCheirNeg = 0, audCheirTot = 0;
@@ -293,6 +293,19 @@ protected:
     /// [m]. Lines.minBaseline in the settings file. At the 2 deg parallax floor
     /// the reachable depth is about baseline/tan(2 deg) = 28x this value.
     float mfLineMinBaseline = 0.20f;
+    /// Max distance of a map point from a segment's great circle for that
+    /// point to be considered ON the edge [px].
+    float mfLinePtMaxPx = 3.0f;
+    /// Two points must be at least this far apart in 3D before the direction
+    /// they define is trusted [m].
+    float mfLinePtMinSep = 0.10f;
+    /// Lines.pointsOnly: refuse to create a line that has no points on it.
+    bool mbLinePointsOnly = false;
+    /// Max perpendicular distance from the fitted 3D line for an on-circle
+    /// point to count as an inlier [m].
+    float mfLinePtInlier = 0.05f;
+    /// Deepest inlier may be at most this many times the depth of the nearest.
+    float mfLinePtDepthRatio = 2.5f;
 
     /// Map->frame line re-acquisition (SearchByProjection for lines):
     /// recently-seen line landmarks propose themselves to unbound segments

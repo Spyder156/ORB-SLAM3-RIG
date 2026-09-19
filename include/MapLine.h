@@ -31,6 +31,7 @@
 #include <atomic>
 #include <map>
 #include <mutex>
+#include <vector>
 
 #include <Eigen/Core>
 #include <Eigen/Geometry>
@@ -39,6 +40,7 @@ namespace ORB_SLAM3 {
 
 class KeyFrame;
 class Map;
+class MapPoint;
 
 class MapLine {
 public:
@@ -96,10 +98,27 @@ public:
     void SetBadFlag();
     bool isBad();
 
+    /// SUPPORT POINTS -- map points that lie ON this edge (their bearing sits
+    /// within a few pixels of the observed great circle, inside the observed
+    /// arc). The point cloud is the only depth source this rig can trust:
+    /// measured, plane-intersection depth is unobservable under our motion
+    /// (the interpretation planes form a thin sheaf), and both re-triangulation
+    /// and BA freely slide a line along that unobservable direction. A line
+    /// with >= 2 support points therefore has its geometry FIT TO THE POINTS,
+    /// is never re-solved from planes, and enters BA fixed.
+    void AddSupportPoint(MapPoint* pMP);
+    int  SupportCount();
+    /// Robust line fit to the support points: best-pair search, PCA refine on
+    /// the inliers, endpoints = inlier span. Returns false if degenerate.
+    bool RefitFromPoints(float inlierTol = 0.05f, int minInliers = 2,
+                         float minSpan = 0.05f);
+
     long unsigned int mnId;
     static long unsigned int nNextId;
     /// Extent-gate audit counters (see MapLine.cc).
     static std::atomic<long> nRejParallel, nRejDepth, nRejRatio, nRejLong, nAccepted;
+    /// Lines.viewAngleMinSinSq -- see MapLine.cc.
+    static float kMinSinSqViewAngle;
     long unsigned int mnBALocalForKF = 0;
     int mnVisible = 1, mnFound = 1;
     /// Fraction of the frames in which this landmark was PREDICTED to be
@@ -171,6 +190,7 @@ protected:
     Eigen::Vector3f mDir;      ///< unit direction
     Eigen::Vector3f mMom;      ///< moment, orthogonal to mDir
     std::map<KeyFrame*, int> mObservations;
+    std::vector<MapPoint*> mvpSupport;   ///< guarded by mMutexFeatures
     KeyFrame* mpRefKF;
     Map* mpMap;
     bool mbBad = false;

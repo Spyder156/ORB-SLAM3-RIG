@@ -2900,7 +2900,11 @@ void Optimizer::LocalInertialBA(KeyFrame *pKF, bool *pbStopFlag, Map *pMap, int&
         // constrain the POSE exactly as before, but BA may not invent its
         // geometry. This is what MapPointCulling's 3-observation rule does
         // for points, stated in the form a line needs.
-        const bool bDetermined = vUsable.size() >= LINE_BA_MIN_OBS;
+        // Point-supported lines enter FIXED: their geometry is fit to the
+        // point cloud, which BA is already refining. Their edges still
+        // constrain the poses.
+        const bool bDetermined = (vUsable.size() >= LINE_BA_MIN_OBS)
+                                 && (pML->SupportCount() < 2);
 
         Eigen::Vector3f vS, vE; pML->GetEndpoints(vS, vE);
         VertexLine* vLine = new VertexLine(vS, vE);
@@ -3080,6 +3084,14 @@ void Optimizer::LocalInertialBA(KeyFrame *pKF, bool *pbStopFlag, Map *pMap, int&
         g2o::VertexSBAPointXYZ* vPoint = static_cast<g2o::VertexSBAPointXYZ*>(optimizer.vertex(pMP->mnId+iniMPid+1));
         pMP->SetWorldPos(vPoint->estimate().cast<float>());
         pMP->UpdateNormalAndDepth();
+    }
+
+    // Point-supported lines ride their points, which BA just refined.
+    for(list<MapLine*>::iterator lit=lLocalMapLines.begin(), lend=lLocalMapLines.end(); lit!=lend; lit++)
+    {
+        MapLine* pML = *lit;
+        if(pML && !pML->isBad() && pML->SupportCount() >= 2)
+            pML->RefitFromPoints();
     }
 
     //Lines: write the refined Plucker back (SetPlucker re-normalises d and

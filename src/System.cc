@@ -854,7 +854,7 @@ void System::SaveMapLines(const string &filename)
     const Sophus::SE3f Tb0w = Twb0.inverse();
 
     ofstream f(filename);
-    f << fixed << "t,x1,y1,z1,x2,y2,z2,validated,id" << endl;
+    f << fixed << "t,x1,y1,z1,x2,y2,z2,validated,id,support" << endl;
     long n = 0, noext = 0;
     for(MapLine* pML : pBiggerMap->GetAllMapLines())
     {
@@ -881,7 +881,8 @@ void System::SaveMapLines(const string &filename)
         f << setprecision(9) << t << "," << setprecision(6)
           << e1(0) << "," << e1(1) << "," << e1(2) << ","
           << e2(0) << "," << e2(1) << "," << e2(2) << ","
-          << pML->mnValidated << "," << pML->mnId << endl;
+          << pML->mnValidated << "," << pML->mnId << ","
+          << pML->SupportCount() << endl;
         n++;
     }
     f.close();

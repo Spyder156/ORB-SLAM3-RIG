@@ -1,6 +1,7 @@
 #include "MapLine.h"
 #include "Map.h"
 #include "KeyFrame.h"
+#include "MapPoint.h"
 
 #include <cmath>
 
@@ -11,6 +12,9 @@
 namespace ORB_SLAM3 {
 
 long unsigned int MapLine::nNextId = 0;
+// Minimum sin^2 of the angle between an observed bearing and the line before
+// their intersection is trusted. 0.25 = 30 deg (PLVS), 0.0194 = 8 deg (old).
+float MapLine::kMinSinSqViewAngle = 0.25f;
 // Extent-gate audit: which test refuses to record where a line was seen.
 // A refused observation leaves the landmark with NO extent, so it is dropped
 // from the map dump entirely -- a systematic filter on WHICH GEOMETRY the map
@@ -143,7 +147,12 @@ bool MapLine::SetExtentFromBearings(const Eigen::Matrix3f& Rcw,
         const float den = cr.squaredNorm();
         // sin(bearing, line) >= sin(8 deg): nearly-parallel geometry amplifies
         // moment noise by 1/sin^2 and produced tens-of-metre radial spikes
-        if (!std::isfinite(den) || den < 0.0194f) { why = 1; return false; }
+        // sin^2 of the angle between the bearing and the line. At 8 deg the
+        // intersection is amplified 7x; a line pointing near the view ray then
+        // gets an absurd extent that radiates away from the camera -- which is
+        // what the map's long segments are. PLVS refuses anything within 30 deg
+        // (kCosViewZAngleMax = cos 30). sin^2(30) = 0.25.
+        if (!std::isfinite(den) || den < kMinSinSqViewAngle) { why = 1; return false; }
         const float s = m_c.dot(cr) / den;
         if (!std::isfinite(s) || s <= 0.05f || s > maxDepth) { why = 2; return false; }
         sv = s;
@@ -242,6 +251,80 @@ std::map<KeyFrame*, int> MapLine::GetObservations() {
 int MapLine::Observations() {
     std::unique_lock<std::mutex> lk(mMutexFeatures);
     return int(mObservations.size());
+}
+
+void MapLine::AddSupportPoint(MapPoint* pMP) {
+    if (!pMP || pMP->isBad()) return;
+    std::unique_lock<std::mutex> lk(mMutexFeatures);
+    for (MapPoint* q : mvpSupport) if (q == pMP) return;
+    if (mvpSupport.size() >= 80) return;          // enough to fit a line
+    mvpSupport.push_back(pMP);
+}
+
+int MapLine::SupportCount() {
+    std::unique_lock<std::mutex> lk(mMutexFeatures);
+    int n = 0;
+    for (MapPoint* q : mvpSupport) if (q && !q->isBad()) n++;
+    return n;
+}
+
+bool MapLine::RefitFromPoints(float inlierTol, int minInliers, float minSpan) {
+    // copy live support positions (prune dead ones while at it)
+    std::vector<Eigen::Vector3f> P;
+    {
+        std::unique_lock<std::mutex> lk(mMutexFeatures);
+        std::vector<MapPoint*> keep;
+        for (MapPoint* q : mvpSupport) {
+            if (!q || q->isBad()) continue;
+            keep.push_back(q);
+            P.push_back(q->GetWorldPos());
+        }
+        mvpSupport.swap(keep);
+    }
+    if ((int)P.size() < minInliers) return false;
+
+    // best collinear pair (points share a great circle without sharing an
+    // edge -- e.g. near wall + through a doorway -- so a plain PCA over all
+    // of them fits the outlier geometry; find the consensus line first)
+    int bi = -1, bj = -1, bestIn = 0;
+    for (size_t i = 0; i < P.size(); i++)
+        for (size_t j = i + 1; j < P.size(); j++) {
+            Eigen::Vector3f d = P[j] - P[i];
+            const float dn = d.norm();
+            if (dn < minSpan) continue;
+            d /= dn;
+            int nin = 0;
+            for (const auto& X : P)
+                if ((X - P[i]).cross(d).norm() < inlierTol) nin++;
+            if (nin > bestIn) { bestIn = nin; bi = int(i); bj = int(j); }
+        }
+    if (bi < 0 || bestIn < minInliers) return false;
+
+    Eigen::Vector3f d0 = (P[bj] - P[bi]).normalized();
+    // PCA refine over the inliers
+    Eigen::Vector3f c = Eigen::Vector3f::Zero(); int nin = 0;
+    for (const auto& X : P)
+        if ((X - P[bi]).cross(d0).norm() < inlierTol) { c += X; nin++; }
+    c /= float(nin);
+    Eigen::Matrix3f C = Eigen::Matrix3f::Zero();
+    for (const auto& X : P)
+        if ((X - P[bi]).cross(d0).norm() < inlierTol) {
+            const Eigen::Vector3f q = X - c;
+            C += q * q.transpose();
+        }
+    Eigen::SelfAdjointEigenSolver<Eigen::Matrix3f> es(C);
+    Eigen::Vector3f d = es.eigenvectors().col(2);      // largest eigenvalue
+    if (d.dot(d0) < 0.f) d = -d;
+    // endpoints = inlier span along the fitted axis
+    float tmin = 1e9f, tmax = -1e9f;
+    for (const auto& X : P) {
+        if ((X - c).cross(d).norm() >= inlierTol) continue;
+        const float t = (X - c).dot(d);
+        tmin = std::min(tmin, t); tmax = std::max(tmax, t);
+    }
+    if (!(tmax - tmin >= minSpan)) return false;
+    SetEndpoints(c + d * tmin, c + d * tmax);
+    return true;
 }
 
 void MapLine::SetBadFlag() {

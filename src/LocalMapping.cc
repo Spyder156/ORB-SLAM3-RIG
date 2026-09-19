@@ -388,6 +388,10 @@ void LocalMapping::RetriangulateLines()
     int nTried = 0, nImproved = 0; double gainSum = 0.0;
     for(MapLine* pML : sLines)
     {
+        if(pML->SupportCount() >= 2){        // point-supported: geometry rides
+            pML->RefitFromPoints();          // the points, never the planes
+            continue;
+        }
         // gather this landmark's observations, each as a world-frame plane
         struct Ob { Eigen::Vector3f nw, nc, t; Eigen::Matrix3f R; Eigen::Vector3f b1, b2; };
         std::vector<Ob> obs;
