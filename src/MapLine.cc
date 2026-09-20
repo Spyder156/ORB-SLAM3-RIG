@@ -15,6 +15,7 @@ long unsigned int MapLine::nNextId = 0;
 // Minimum sin^2 of the angle between an observed bearing and the line before
 // their intersection is trusted. 0.25 = 30 deg (PLVS), 0.0194 = 8 deg (old).
 float MapLine::kMinSinSqViewAngle = 0.25f;
+bool MapLine::kVoteInPose = true;
 // Extent-gate audit: which test refuses to record where a line was seen.
 // A refused observation leaves the landmark with NO extent, so it is dropped
 // from the map dump entirely -- a systematic filter on WHICH GEOMETRY the map
@@ -269,6 +270,14 @@ int MapLine::SupportCount() {
 }
 
 bool MapLine::RefitFromPoints(float inlierTol, int minInliers, float minSpan) {
+    // A PAIR IS NEVER TRUSTED ALONE. Any two well-separated points define a
+    // line with themselves as its only inliers, so minInliers=2 re-admits the
+    // doorway failure (near point + far point on one viewing circle -> a long
+    // chord through empty space). Three points must AGREE before the fit is
+    // geometry, and the consensus must cover most of the support set --
+    // otherwise this "line" is a mixture of different physical edges (the
+    // three-pencils case) and updating from it would be fiction.
+    minInliers = std::max(minInliers, 3);
     // copy live support positions (prune dead ones while at it)
     std::vector<Eigen::Vector3f> P;
     {
@@ -298,7 +307,9 @@ bool MapLine::RefitFromPoints(float inlierTol, int minInliers, float minSpan) {
                 if ((X - P[i]).cross(d).norm() < inlierTol) nin++;
             if (nin > bestIn) { bestIn = nin; bi = int(i); bj = int(j); }
         }
-    if (bi < 0 || bestIn < minInliers) return false;
+    if (bi < 0 || bestIn < minInliers) { mnFitFail++; return false; }
+    if (float(bestIn) < 0.6f * float(P.size())) { mnFitFail++; return false; }
+    mnFitFail = 0;
 
     Eigen::Vector3f d0 = (P[bj] - P[bi]).normalized();
     // PCA refine over the inliers

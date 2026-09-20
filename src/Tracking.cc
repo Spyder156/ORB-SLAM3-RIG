@@ -657,6 +657,9 @@ void Tracking::newParameterLoader(Settings *settings) {
             const int   mpx  = lfs["Lines.minLenPx"].empty()     ? 15    : (int)lfs["Lines.minLenPx"];
             mbLineReacq = lfs["Lines.reacq"].empty() || (int)lfs["Lines.reacq"] != 0;
             mbLinePointsOnly = !lfs["Lines.pointsOnly"].empty() && (int)lfs["Lines.pointsOnly"] != 0;
+
+            if(!lfs["Lines.vote"].empty())
+                MapLine::kVoteInPose = (int)lfs["Lines.vote"] != 0;
             if(!lfs["Lines.viewAngleMinSinSq"].empty())
                 MapLine::kMinSinSqViewAngle = (float)lfs["Lines.viewAngleMinSinSq"];
             if(!lfs["Lines.minBaseline"].empty())
@@ -671,6 +674,8 @@ void Tracking::newParameterLoader(Settings *settings) {
                                                             : (int)lfs["Lines.dumpTo"];
             }
             mpLineExtractor = new LineExtractor(minA, maxA, gth, mpx);
+            if(!lfs["Lines.mergeCircles"].empty())
+                mpLineExtractor->mbMergeCircles = (int)lfs["Lines.mergeCircles"] != 0;
             for(int mc = 0; mc < 2; mc++){
                 char key[32]; snprintf(key, sizeof(key), "Lines.mask%d", mc);
                 if(lfs[key].empty() || !lfs[key].isString()) continue;
@@ -1755,6 +1760,8 @@ Sophus::SE3f Tracking::GrabImageMonoRig(const cv::Mat &im0, const cv::Mat &im1,
     }
 
     // ---- spherical lines, both lenses into one container ------------------
+    static std::vector<double> sLineMs1, sLineMs2;
+    auto tL0 = std::chrono::steady_clock::now();
     if(mbUseLines && mpLineExtractor){
         std::vector<LineObs> l0 = mpLineExtractor->Extract(mImGray, mpCamera, 0);
         std::vector<LineObs> l1 = mpLineExtractor->Extract(imGrayRight, mpCamera2, 1);
@@ -1848,6 +1855,10 @@ Sophus::SE3f Tracking::GrabImageMonoRig(const cv::Mat &im0, const cv::Mat &im1,
         // (triangulation happens AFTER Track(): the pose does not exist yet)
     }
 
+    if(mbUseLines){
+        sLineMs1.push_back(std::chrono::duration<double,std::milli>(
+            std::chrono::steady_clock::now()-tL0).count());
+    }
     if (mState==NO_IMAGES_YET) t0=timestamp;
     mCurrentFrame.mNameFile = filename;
     mCurrentFrame.mnDataset = mnNumDataset;
@@ -1855,6 +1866,7 @@ Sophus::SE3f Tracking::GrabImageMonoRig(const cv::Mat &im0, const cv::Mat &im1,
     Track();
 
     // ---- lines: triangulate now that Track() has produced a pose -----------
+    auto tL1 = std::chrono::steady_clock::now();
     if(mbUseLines && !mCurrentFrame.mvLines.empty())
     {
         if(mCurrentFrame.HasPose())
@@ -2404,7 +2416,10 @@ Sophus::SE3f Tracking::GrabImageMonoRig(const cv::Mat &im0, const cv::Mat &im1,
                     if(t < a1 - margin || t > a2 + margin) continue;
                     pL->AddSupportPoint(pb.p); grew = true;
                 }
-                if(grew && pL->SupportCount() >= 2) pL->RefitFromPoints();
+                if(grew && pL->SupportCount() >= 3){
+                    pL->RefitFromPoints();
+                    if(pL->mnFitFail > 5) pL->SetBadFlag();   // mixed-edge support
+                }
             }
 
             // ---- pool upkeep: every landmark bound in THIS frame (carried,
@@ -2486,6 +2501,18 @@ Sophus::SE3f Tracking::GrabImageMonoRig(const cv::Mat &im0, const cv::Mat &im1,
         }
 
         mvPrevLines = mCurrentFrame.mvLines;
+        sLineMs2.push_back(std::chrono::duration<double,std::milli>(
+            std::chrono::steady_clock::now()-tL1).count());
+        if(sLineMs2.size() % 200 == 0){
+            auto pct=[](std::vector<double> v,double q){
+                std::sort(v.begin(),v.end());
+                return v[size_t(q*(v.size()-1))]; };
+            std::cout << "[AUDIT] line timing ms: extract+match p50 "
+                      << pct(sLineMs1,0.5) << " p95 " << pct(sLineMs1,0.95)
+                      << " | lifecycle p50 " << pct(sLineMs2,0.5)
+                      << " p95 " << pct(sLineMs2,0.95)
+                      << "  (budget 33)" << std::endl;
+        }
     }
 
     return mCurrentFrame.GetPose();

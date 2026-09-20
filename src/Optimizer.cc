@@ -2852,7 +2852,7 @@ void Optimizer::LocalInertialBA(KeyFrame *pKF, bool *pbStopFlag, Map *pMap, int&
     const size_t LINE_BA_MIN_OBS = 4;   // 3-obs lines measured unstable (43-137 cm/call)
 
     list<MapLine*> lLocalMapLines;
-    for(int i=0; i<N; i++)
+    for(int i=0; MapLine::kVoteInPose && i<N; i++)
     {
         KeyFrame* pKFi = vpOptimizableKFs[i];
         for(MapLine* pML : pKFi->mvpMapLines)
@@ -4903,7 +4903,7 @@ int Optimizer::PoseInertialOptimizationLastKeyFrame(Frame *pFrame, bool bRecInit
     int nLineEdgesK = 0;
     std::vector<EdgeLineOnlyPose*> vpEdgesLineK;
     std::vector<size_t> vnIndexEdgeLineK;
-    if(!pFrame->mvLines.empty() && !pFrame->mvpMapLines.empty())
+    if(MapLine::kVoteInPose && !pFrame->mvLines.empty() && !pFrame->mvpMapLines.empty())
     {
         const float f0 = pFrame->mpCamera ? pFrame->mpCamera->getParameter(0) : 400.f;
         const double infoLineK = 1.0 / 9.0;   // sigma = 3 px (residual is in PIXELS)
@@ -5346,7 +5346,7 @@ int Optimizer::PoseInertialOptimizationLastFrame(Frame *pFrame, bool bRecInit)
     int nLineEdges = 0;
     std::vector<EdgeLineOnlyPose*> vpEdgesLine;
     std::vector<size_t> vnIndexEdgeLine;
-    if(!pFrame->mvLines.empty() && !pFrame->mvpMapLines.empty())
+    if(MapLine::kVoteInPose && !pFrame->mvLines.empty() && !pFrame->mvpMapLines.empty())
     {
         const float f0 = pFrame->mpCamera ? pFrame->mpCamera->getParameter(0) : 400.f;
         const double infoLine = 1.0;          // residual is in PIXELS

@@ -119,6 +119,11 @@ public:
     static std::atomic<long> nRejParallel, nRejDepth, nRejRatio, nRejLong, nAccepted;
     /// Lines.viewAngleMinSinSq -- see MapLine.cc.
     static float kMinSinSqViewAngle;
+    /// Lines.vote (default 1): when 0, lines are pure CARTOGRAPHY -- tracked,
+    /// supported, refit, drawn -- but excluded from every pose optimiser, so
+    /// trajectory quality is exactly the points-only baseline. Lets the map be
+    /// judged on healthy poses, decoupled from robustness questions.
+    static bool kVoteInPose;
     long unsigned int mnBALocalForKF = 0;
     int mnVisible = 1, mnFound = 1;
     /// Fraction of the frames in which this landmark was PREDICTED to be
@@ -150,6 +155,10 @@ public:
     long mnLastFrameSeen = -1;     ///< frame id this landmark last bound a segment
     bool mbInReacqPool = false;    ///< currently in Tracking's recent-lines pool
     long mnValidatedFrameId = -1;  ///< guard: re-acq validates once per frame
+    /// Consecutive support-fit failures. A support set that repeatedly cannot
+    /// reach consensus is a mixture of different physical edges; the landmark
+    /// is deleted after a few strikes (see Tracking support pass).
+    int mnFitFail = 0;
 
     /// First observation (plane normal + lens pose), kept so the line can be
     /// RE-TRIANGULATED against later, wider-baseline observations -- the
