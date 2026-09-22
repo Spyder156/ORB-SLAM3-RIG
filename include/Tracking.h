@@ -344,7 +344,10 @@ protected:
     int  mnCoastMinStreak     = 30;  ///< Tracking.coastMinStreak: frames of confidence before arming
     int  mnCoastRelatchMinKPs = 300; ///< Tracking.coastRelatchMinKPs: skip re-latch on darker frames
     int  mnGoodStreak = 0;           ///< consecutive confident OK frames
-    bool mbCoastArmed = false;       ///< confident recently -> a drop may coast
+    /// LATCHED once the map has proven itself (BA2 + one confident streak);
+    /// cleared only on map reset/change. Failures arrive ~13 s after the last
+    /// confident stretch (measured), so arming must persist, not expire.
+    bool mbCoastArmed = false;
     bool mbCoasting = false;         ///< currently inside a coasted dropout
     KeyFrame* mpCoastAnchorKF = nullptr;  ///< last KF before the dropout
     /// Relocalize mCurrentFrame against an explicit candidate set (the body of

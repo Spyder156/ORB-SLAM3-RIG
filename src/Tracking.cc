@@ -3216,9 +3216,20 @@ void Tracking::Track()
             mnGoodStreak++;
         else
             mnGoodStreak = 0;
-        mbCoastArmed = (mnGoodStreak >= mnCoastMinStreak) &&
-                       pCurrentMap->isImuInitialized() &&
-                       pCurrentMap->GetIniertialBA2();
+        // The arm LATCHES: measured on run_2, failures arrive a median of 391
+        // frames (~13 s) after the last confident stretch -- the dark zone
+        // degrades long before it kills. Requiring confidence at the instant
+        // of failure would never arm (0 of 63 failures qualified). Once this
+        // map has proven itself (BA2 + one confident streak), every later
+        // failure coasts; the latch clears only with the map.
+        if(!mbCoastArmed && mnGoodStreak >= mnCoastMinStreak &&
+           pCurrentMap->isImuInitialized() && pCurrentMap->GetIniertialBA2())
+        {
+            mbCoastArmed = true;
+            std::cout << "[Debug] COAST: armed -- map proven ("
+                      << mnCoastMinStreak << " confident frames post-BA2)"
+                      << std::endl;
+        }
         if(mState==LOST && mbCoasting)
         {
             std::cout << "[Debug] COAST: abandoned (grace expired), stock LOST handling" << std::endl;
