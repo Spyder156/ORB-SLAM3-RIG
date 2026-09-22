@@ -644,6 +644,12 @@ void Tracking::newParameterLoader(Settings *settings) {
         std::cout << "[Debug] Tracking: RECENTLY_LOST needs > "
                   << mnRecentlyLostMinInliers << " inliers to trust vision"
                   << std::endl;
+        if(!tfs["Tracking.coastRestore"].empty())
+            mbCoastRestore = (int)tfs["Tracking.coastRestore"] != 0;
+        if(!tfs["Tracking.recentlyLostSecs"].empty())
+            time_recently_lost = (double)(float)tfs["Tracking.recentlyLostSecs"];
+        std::cout << "[Debug] Tracking: coastRestore=" << (mbCoastRestore ? 1 : 0)
+                  << "  recentlyLostSecs=" << time_recently_lost << std::endl;
     }
 
     {   // ---- spherical line features (off unless asked for) ----
@@ -3921,11 +3927,18 @@ bool Tracking::TrackLocalMap()
                 aux2++;
         }
 
-    // Snapshot the IMU-propagated pose BEFORE the visual optimisation touches
+    // Snapshot the IMU-propagated state BEFORE the visual optimisation touches
     // it. Refusing the visual update at the bottom of this function is not
-    // enough on its own: PoseInertialOptimization* writes straight into
-    // mCurrentFrame, so without this the corrupted pose survives the refusal.
+    // enough on its own: PoseInertialOptimization* writes pose, VELOCITY and
+    // BIASES straight into mCurrentFrame (Optimizer.cc SetImuPoseVelocity +
+    // mImuBias). Without this the corrupted state survives the refusal,
+    // becomes mLastFrame, and the next PredictStateIMU integrates from it --
+    // velocity error compounds every coasted frame.
+    // Tcw_imu_pred : SE3f, world -> camera
+    // Vw_imu_pred  : m/s, world frame (IMU body velocity)
     const Sophus::SE3f Tcw_imu_pred = mCurrentFrame.GetPose();
+    const Eigen::Vector3f Vw_imu_pred = mCurrentFrame.GetVelocity();
+    const IMU::Bias bias_imu_pred = mCurrentFrame.mImuBias;
 
     int inliers;
     if (!mpAtlas->isImuInitialized())
@@ -4027,6 +4040,10 @@ bool Tracking::TrackLocalMap()
         return true;
     if(mState==RECENTLY_LOST && mnMatchesInliers <= mnRecentlyLostMinInliers){
         mCurrentFrame.SetPose(Tcw_imu_pred);          // hand the frame back to the IMU
+        if(mbCoastRestore){                           // ... ALL of it: the failed
+            mCurrentFrame.SetVelocity(Vw_imu_pred);   // optimiser's velocity/bias must
+            mCurrentFrame.mImuBias = bias_imu_pred;   // not seed the next propagation
+        }
         for(int i=0; i<mCurrentFrame.N; i++)          // and drop the associations that
             if(mCurrentFrame.mvpMapPoints[i])         // pulled it off course, so they are
                 mCurrentFrame.mvbOutlier[i] = true;   // not promoted into a keyframe
@@ -4043,6 +4060,22 @@ bool Tracking::TrackLocalMap()
     {
         if((mnMatchesInliers<15 && mpAtlas->isImuInitialized())||(mnMatchesInliers<50 && !mpAtlas->isImuInitialized()))
         {
+            // This failure flips the state to RECENTLY_LOST, but the frame
+            // still becomes mLastFrame -- with the FAILED optimiser's pose,
+            // velocity and biases in it. That polluted state is what the whole
+            // coast then integrates from. Hand the frame back to the IMU
+            // prediction so the coast starts clean. (Post-init only: before
+            // IMU init there is no prediction to restore.)
+            if(mbCoastRestore && mpAtlas->isImuInitialized()){
+                mCurrentFrame.SetPose(Tcw_imu_pred);
+                mCurrentFrame.SetVelocity(Vw_imu_pred);
+                mCurrentFrame.mImuBias = bias_imu_pred;
+                static long nCoast = 0;
+                if(++nCoast % 20 == 1)
+                    std::cout << "[Debug] TrackLocalMap fail (" << mnMatchesInliers
+                              << " inliers): frame handed back to IMU prediction"
+                              << std::endl;
+            }
             return false;
         }
         else

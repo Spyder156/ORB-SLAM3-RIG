@@ -325,6 +325,13 @@ protected:
     /// while RECENTLY_LOST. Upstream hardcodes 10.
     int mnRecentlyLostMinInliers = 10;
 
+    /// Tracking.coastRestore (default 1). When a visual update is refused,
+    /// restore the FULL IMU-propagated state -- pose AND velocity AND biases.
+    /// Restoring only the pose leaves the failed optimiser's velocity/bias in
+    /// the frame; mLastFrame inherits them and every later PredictStateIMU
+    /// integrates from a polluted state. 0 = upstream behaviour (pose only).
+    bool mbCoastRestore = true;
+
     /// Below this many inliers the FRAME is blind, not the landmarks: the
     /// visibility ticks charged this frame are refunded so MapPointCulling()
     /// does not destroy the landmarks that would bridge the gap.
