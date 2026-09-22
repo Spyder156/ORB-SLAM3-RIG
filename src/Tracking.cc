@@ -648,8 +648,17 @@ void Tracking::newParameterLoader(Settings *settings) {
             mbCoastRestore = (int)tfs["Tracking.coastRestore"] != 0;
         if(!tfs["Tracking.recentlyLostSecs"].empty())
             time_recently_lost = (double)(float)tfs["Tracking.recentlyLostSecs"];
+        if(!tfs["Tracking.coastConfInliers"].empty())
+            mnCoastConfInliers = (int)tfs["Tracking.coastConfInliers"];
+        if(!tfs["Tracking.coastMinStreak"].empty())
+            mnCoastMinStreak = (int)tfs["Tracking.coastMinStreak"];
+        if(!tfs["Tracking.coastRelatchMinKPs"].empty())
+            mnCoastRelatchMinKPs = (int)tfs["Tracking.coastRelatchMinKPs"];
         std::cout << "[Debug] Tracking: coastRestore=" << (mbCoastRestore ? 1 : 0)
-                  << "  recentlyLostSecs=" << time_recently_lost << std::endl;
+                  << "  recentlyLostSecs=" << time_recently_lost
+                  << "  coast arm: >=" << mnCoastConfInliers << " inliers x "
+                  << mnCoastMinStreak << " frames, relatch needs "
+                  << mnCoastRelatchMinKPs << " kps" << std::endl;
     }
 
     {   // ---- spherical line features (off unless asked for) ----
@@ -2929,6 +2938,15 @@ void Tracking::Track()
                         // cout << "KF in map: " << pCurrentMap->KeyFramesInMap() << endl;
                         mState = RECENTLY_LOST;
                         mTimeStampLost = mCurrentFrame.mTimeStamp;
+                        if(mbCoastArmed && !mbCoasting)
+                        {   // dropped off confident vision -> coast; remember
+                            // the last KFs that SAW something, for the re-latch
+                            mbCoasting = true;
+                            mpCoastAnchorKF = mpLastKeyFrame;
+                            std::cout << "[Debug] COAST: engaged (pre-map fail), anchor KF "
+                                      << (mpCoastAnchorKF ? (long)mpCoastAnchorKF->mnId : -1)
+                                      << std::endl;
+                        }
                     }
                     else
                     {
@@ -2950,6 +2968,14 @@ void Tracking::Track()
                             PredictStateIMU();
                         else
                             bOK = false;
+
+                        // Coasting: the IMU pose above is the fallback. On any
+                        // frame with enough features, try to re-latch onto the
+                        // keyframes from BEFORE the dropout (BoW -- immune to
+                        // however far the IMU has drifted). Success replaces
+                        // the frame's pose+matches; TrackLocalMap confirms it.
+                        if(bOK && mbCoasting && TryCoastRelatch())
+                            mTimeStampLost = mCurrentFrame.mTimeStamp; // fresh grace
 
                         if (mCurrentFrame.mTimeStamp-mTimeStampLost>time_recently_lost)
                         {
@@ -3101,7 +3127,16 @@ void Tracking::Track()
         }
 
         if(bOK)
+        {
             mState = OK;
+            if(mbCoasting)
+            {   // vision confirmed the pose again -> the dropout is over
+                std::cout << "[Debug] COAST: exit, vision confirmed ("
+                          << mnMatchesInliers << " inliers)" << std::endl;
+                mbCoasting = false;
+                mpCoastAnchorKF = nullptr;
+            }
+        }
         else if (mState == OK)
         {
             if (mSensor == System::IMU_MONOCULAR || mSensor == System::IMU_STEREO || mSensor == System::IMU_RGBD)
@@ -3114,6 +3149,15 @@ void Tracking::Track()
                 }
 
                 mState=RECENTLY_LOST;
+                if(mbCoastArmed && !mbCoasting)
+                {
+                    mbCoasting = true;
+                    mpCoastAnchorKF = mpLastKeyFrame;
+                    std::cout << "[Debug] COAST: engaged, anchor KF "
+                              << (mpCoastAnchorKF ? (long)mpCoastAnchorKF->mnId : -1)
+                              << " (" << mnMatchesInliers << " inliers this frame)"
+                              << std::endl;
+                }
             }
             else
                 mState=RECENTLY_LOST; // visual to lost
@@ -3163,6 +3207,38 @@ void Tracking::Track()
         if(mCurrentFrame.isSet())
             mpMapDrawer->SetCurrentCameraPose(mCurrentFrame.GetPose());
 
+        // ---- coast arming + per-frame confidence dump -----------------------
+        // Confident = tracking OK on a healthy inlier count, sustained for a
+        // streak. Only a drop FROM this state may coast; a drop during/near
+        // initialization keeps stock behaviour (fast reset) so bad VI inits
+        // die instead of being carried.
+        if(mState==OK && mnMatchesInliers >= mnCoastConfInliers)
+            mnGoodStreak++;
+        else
+            mnGoodStreak = 0;
+        mbCoastArmed = (mnGoodStreak >= mnCoastMinStreak) &&
+                       pCurrentMap->isImuInitialized() &&
+                       pCurrentMap->GetIniertialBA2();
+        if(mState==LOST && mbCoasting)
+        {
+            std::cout << "[Debug] COAST: abandoned (grace expired), stock LOST handling" << std::endl;
+            mbCoasting = false;
+            mpCoastAnchorKF = nullptr;
+        }
+        {   // f_conf.csv: t[s] (same clock as f_orb), state, inliers this
+            // frame, keypoints detected, map id, coasting flag
+            if(!mConfDump.is_open())
+            {
+                mConfDump.open("f_conf.csv");
+                mConfDump << "t,state,inliers,nkp,map,coasting\n";
+            }
+            char buf[128];
+            snprintf(buf, sizeof(buf), "%.6f,%d,%d,%d,%ld,%d\n",
+                     mCurrentFrame.mTimeStamp, (int)mState, mnMatchesInliers,
+                     mCurrentFrame.N, (long)pCurrentMap->GetId(), mbCoasting ? 1 : 0);
+            mConfDump << buf;
+        }
+
         if(bOK || mState==RECENTLY_LOST)
         {
             // Update motion model
@@ -3204,9 +3280,13 @@ void Tracking::Track()
 #endif
             bool bNeedKF = NeedNewKeyFrame();
 
-            // Check if we need to insert a new keyframe
-            // if(bNeedKF && bOK)
-            if(bNeedKF && (bOK || (mInsertKFsLost && mState==RECENTLY_LOST &&
+            // Check if we need to insert a new keyframe. Never while coasting:
+            // a coasted frame has an IMU guess and no verified observations --
+            // promoting it to a keyframe would anchor the map on a guess. The
+            // dark stretch is bridged by preintegration alone and its frames
+            // are "skipped" as far as the map is concerned.
+            if(bNeedKF && !mbCoasting &&
+               (bOK || (mInsertKFsLost && mState==RECENTLY_LOST &&
                                    (mSensor == System::IMU_MONOCULAR || mSensor == System::IMU_STEREO || mSensor == System::IMU_RGBD))))
                 CreateNewKeyFrame();
 
@@ -3657,6 +3737,12 @@ void Tracking::CreateMapInAtlas()
     mCurrentFrame = Frame();
     mvIniMatches.clear();
 
+    // coast state points into the abandoned map
+    mbCoasting = false;
+    mbCoastArmed = false;
+    mnGoodStreak = 0;
+    mpCoastAnchorKF = nullptr;
+
     mbCreatedMap = true;
 }
 
@@ -4031,14 +4117,16 @@ bool Tracking::TrackLocalMap()
     if(mCurrentFrame.mnId<mnLastRelocFrameId+mMaxFrames && mnMatchesInliers<50)
         return false;
 
-    // RECENTLY_LOST means the IMU is already propagating the pose. Accepting a
-    // visual update on 11 inliers lets a handful of matches from a dark or
-    // blurred frame override that -- which is how run_2 ends up confidently 37 m
-    // wrong after the blackout at t=10157. Raising this bar makes the IMU carry
-    // the gap instead, which is what it is there for.
+    // COASTING means the IMU owns the pose through a dropout that started from
+    // confident tracking. Accepting a visual update on 11 inliers lets a
+    // handful of matches from a dark or blurred frame override that -- which is
+    // how run_2 ends up confidently 37 m wrong after the blackout at t=10157.
+    // While coasting the bar is raised and a refused update hands the frame
+    // fully back to the IMU. NOT coasting (e.g. wobbling shortly after init):
+    // stock ORB-SLAM3 behaviour, so a bad init fails fast and resets.
     if((mnMatchesInliers > mnRecentlyLostMinInliers) && (mState==RECENTLY_LOST))
         return true;
-    if(mState==RECENTLY_LOST && mnMatchesInliers <= mnRecentlyLostMinInliers){
+    if(mState==RECENTLY_LOST && mbCoasting && mnMatchesInliers <= mnRecentlyLostMinInliers){
         mCurrentFrame.SetPose(Tcw_imu_pred);          // hand the frame back to the IMU
         if(mbCoastRestore){                           // ... ALL of it: the failed
             mCurrentFrame.SetVelocity(Vw_imu_pred);   // optimiser's velocity/bias must
@@ -4049,7 +4137,7 @@ bool Tracking::TrackLocalMap()
                 mCurrentFrame.mvbOutlier[i] = true;   // not promoted into a keyframe
         static long nRej = 0;
         if(++nRej % 20 == 1)
-            std::cout << "[Debug] RECENTLY_LOST: rejecting visual update on "
+            std::cout << "[Debug] COAST: rejecting visual update on "
                       << mnMatchesInliers << " inliers (need > "
                       << mnRecentlyLostMinInliers << "); IMU carries" << std::endl;
         return false;
@@ -4064,9 +4152,10 @@ bool Tracking::TrackLocalMap()
             // still becomes mLastFrame -- with the FAILED optimiser's pose,
             // velocity and biases in it. That polluted state is what the whole
             // coast then integrates from. Hand the frame back to the IMU
-            // prediction so the coast starts clean. (Post-init only: before
-            // IMU init there is no prediction to restore.)
-            if(mbCoastRestore && mpAtlas->isImuInitialized()){
+            // prediction so the coast starts clean. Only when a coast is about
+            // to start (armed = dropped off confident vision): an unarmed
+            // failure keeps stock behaviour and resets fast.
+            if(mbCoastRestore && mbCoastArmed && mpAtlas->isImuInitialized()){
                 mCurrentFrame.SetPose(Tcw_imu_pred);
                 mCurrentFrame.SetVelocity(Vw_imu_pred);
                 mCurrentFrame.mImuBias = bias_imu_pred;
@@ -4664,6 +4753,24 @@ bool Tracking::Relocalization()
         return false;
     }
 
+    if(!RelocalizeWith(vpCandidateKFs))
+        return false;
+
+    mnLastRelocFrameId = mCurrentFrame.mnId;
+    cout << "Relocalized!!" << endl;
+    return true;
+}
+
+/// BoW match + MLPnP RANSAC + pose optimisation of mCurrentFrame against an
+/// EXPLICIT keyframe set. This is the body of Relocalization(); the coast
+/// re-latch calls it with the keyframes from just before a visual dropout,
+/// so re-latching is drift-independent (BoW, not projection from the possibly
+/// drifted IMU pose). Expects mCurrentFrame.ComputeBoW() already done.
+/// On success mCurrentFrame holds the vision pose and its map-point matches;
+/// does NOT touch mnLastRelocFrameId (the reloc-specific IMU-reset machinery
+/// must not fire on a coast re-latch).
+bool Tracking::RelocalizeWith(const vector<KeyFrame*>& vpCandidateKFs)
+{
     const int nKFs = vpCandidateKFs.size();
 
     // We perform first an ORB matching with each candidate
@@ -4806,17 +4913,36 @@ bool Tracking::Relocalization()
         }
     }
 
-    if(!bMatch)
-    {
-        return false;
-    }
-    else
-    {
-        mnLastRelocFrameId = mCurrentFrame.mnId;
-        cout << "Relocalized!!" << endl;
-        return true;
-    }
+    return bMatch;
+}
 
+/// Coast re-latch: after a visual dropout, match the CURRENT frame against the
+/// last keyframes seen BEFORE the dropout (the anchor and its covisibility
+/// neighbourhood). Skipped while the frame is still feature-starved -- a dark
+/// frame cannot re-latch, it can only mismatch.
+bool Tracking::TryCoastRelatch()
+{
+    if(!mpCoastAnchorKF || mpCoastAnchorKF->isBad())
+        return false;
+    if(mCurrentFrame.N < mnCoastRelatchMinKPs)
+        return false;                       // still dark; keep coasting
+
+    vector<KeyFrame*> vC = mpCoastAnchorKF->GetBestCovisibilityKeyFrames(10);
+    vC.push_back(mpCoastAnchorKF);
+    vector<KeyFrame*> vGood;
+    for(KeyFrame* pKF : vC)
+        if(pKF && !pKF->isBad())
+            vGood.push_back(pKF);
+    if(vGood.empty())
+        return false;
+
+    mCurrentFrame.ComputeBoW();
+    if(!RelocalizeWith(vGood))
+        return false;
+
+    std::cout << "[Debug] COAST: re-latched onto pre-dropout KF neighbourhood"
+              << " (anchor KF " << mpCoastAnchorKF->mnId << ")" << std::endl;
+    return true;
 }
 
 void Tracking::Reset(bool bLocMap)
@@ -4874,6 +5000,11 @@ void Tracking::Reset(bool bLocMap)
     mpLastKeyFrame = static_cast<KeyFrame*>(NULL);
     mvIniMatches.clear();
 
+    mbCoasting = false;
+    mbCoastArmed = false;
+    mnGoodStreak = 0;
+    mpCoastAnchorKF = nullptr;
+
     if(mpViewer)
         mpViewer->Release();
 
@@ -4920,6 +5051,12 @@ void Tracking::ResetActiveMap(bool bLocMap)
     mState = NO_IMAGES_YET; //NOT_INITIALIZED;
 
     mbReadyToInitializate = false;
+
+    // coast state points into the cleared map
+    mbCoasting = false;
+    mbCoastArmed = false;
+    mnGoodStreak = 0;
+    mpCoastAnchorKF = nullptr;
 
     list<bool> lbLost;
     // lbLost.reserve(mlbLost.size());

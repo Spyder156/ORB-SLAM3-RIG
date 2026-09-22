@@ -332,6 +332,30 @@ protected:
     /// integrates from a polluted state. 0 = upstream behaviour (pose only).
     bool mbCoastRestore = true;
 
+    /// COAST -- IMU-only traversal of a visual dropout (dark room).
+    /// Armed only after the estimator has been running on CONFIDENT vision
+    /// (IMU init + BA2 done + a streak of well-tracked frames). A failure
+    /// while armed enters coast: the IMU owns the pose, weak visual updates
+    /// are refused, no keyframes are made, and every frame with enough
+    /// features attempts a re-latch against the keyframes from just BEFORE
+    /// the dropout. A failure while NOT armed keeps stock behaviour (fast
+    /// reset), so a bad VI init dies instead of being carried to the end.
+    int  mnCoastConfInliers   = 30;  ///< Tracking.coastConfInliers: streak counts frames with >= this
+    int  mnCoastMinStreak     = 30;  ///< Tracking.coastMinStreak: frames of confidence before arming
+    int  mnCoastRelatchMinKPs = 300; ///< Tracking.coastRelatchMinKPs: skip re-latch on darker frames
+    int  mnGoodStreak = 0;           ///< consecutive confident OK frames
+    bool mbCoastArmed = false;       ///< confident recently -> a drop may coast
+    bool mbCoasting = false;         ///< currently inside a coasted dropout
+    KeyFrame* mpCoastAnchorKF = nullptr;  ///< last KF before the dropout
+    /// Relocalize mCurrentFrame against an explicit candidate set (the body of
+    /// Relocalization(), reused by the coast re-latch with pre-dropout KFs).
+    bool RelocalizeWith(const std::vector<KeyFrame*>& vpCandidateKFs);
+    /// Coast re-latch: BoW+PnP against the anchor KF and its neighbourhood.
+    bool TryCoastRelatch();
+    /// f_conf.csv -- per-frame confidence dump: t[s], state, inliers,
+    /// keypoints, map id, coasting. Written every frame, read by the rerun.
+    std::ofstream mConfDump;
+
     /// Below this many inliers the FRAME is blind, not the landmarks: the
     /// visibility ticks charged this frame are refunded so MapPointCulling()
     /// does not destroy the landmarks that would bridge the gap.
