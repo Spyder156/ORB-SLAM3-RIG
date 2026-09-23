@@ -233,10 +233,17 @@ void Optimizer::BundleAdjustment(const vector<KeyFrame *> &vpKFs, const vector<M
             }
 
             if(pKF->mpCamera2){
+                // rightIndex is the CONCATENATED keypoint index (>= NLeft for
+                // any rear observation); mvKeysRight is rear-only. Checking the
+                // concatenated index against the rear-only size before
+                // subtracting NLeft rejected EVERY rear observation whenever
+                // NLeft > rear count -- rear cameras silently absent from BA.
                 int rightIndex = get<1>(mit->second);
 
-                if(rightIndex != -1 && rightIndex < pKF->mvKeysRight.size()){
+                if(rightIndex != -1){
                     rightIndex -= pKF->NLeft;
+                    if(rightIndex < 0 || rightIndex >= (int)pKF->mvKeysRight.size())
+                        continue;
 
                     Eigen::Matrix<double,2,1> obs;
                     cv::KeyPoint kp = pKF->mvKeysRight[rightIndex];
@@ -279,6 +286,11 @@ void Optimizer::BundleAdjustment(const vector<KeyFrame *> &vpKFs, const vector<M
             vbNotIncludedMP[i]=false;
         }
     }
+
+    // Per-camera edge audit: rear edges were silently ZERO before the NLeft
+    // bounds-order fix; this line is the regression witness.
+    std::cout << "[AUDIT] GBA edges: front " << vpEdgesMono.size()
+              << " rear " << vpEdgesBody.size() << std::endl;
 
     // Optimize!
     optimizer.setVerbose(false);
@@ -397,6 +409,8 @@ void Optimizer::BundleAdjustment(const vector<KeyFrame *> &vpKFs, const vector<M
 
 void Optimizer::FullInertialBA(Map *pMap, int its, const bool bFixLocal, const long unsigned int nLoopId, bool *pbStopFlag, bool bInit, float priorG, float priorA, Eigen::VectorXd *vSingVal, bool *bHess)
 {
+    // per-camera edge audit counters (printed + reset before optimize)
+    static long skFIBAFrontEdges = 0, skFIBARearEdges = 0;
     long unsigned int maxKFid = pMap->GetMaxKFid();
     const vector<KeyFrame*> vpKFs = pMap->GetAllKeyFrames();
     const vector<MapPoint*> vpMPs = pMap->GetAllMapPoints();
@@ -655,6 +669,7 @@ void Optimizer::FullInertialBA(Map *pMap, int its, const bool bFixLocal, const l
                     rk->setDelta(thHuberMono);
 
                     optimizer.addEdge(e);
+                    skFIBAFrontEdges++;
                 }
                 else if(leftIndex != -1 && pKFi->mvuRight[leftIndex] >= 0) // stereo observation
                 {
@@ -685,10 +700,16 @@ void Optimizer::FullInertialBA(Map *pMap, int its, const bool bFixLocal, const l
                 }
 
                 if(pKFi->mpCamera2){ // Monocular right observation
+                    // Same NLeft-order bug as BundleAdjustment: the bound must
+                    // be checked on the REAR-LOCAL index, not the concatenated
+                    // one, or every rear observation is dropped from the very
+                    // BA that initialisation runs (LocalMapping calls this).
                     int rightIndex = get<1>(mit->second);
 
-                    if(rightIndex != -1 && rightIndex < pKFi->mvKeysRight.size()){
+                    if(rightIndex != -1){
                         rightIndex -= pKFi->NLeft;
+                        if(rightIndex < 0 || rightIndex >= (int)pKFi->mvKeysRight.size())
+                            continue;
 
                         Eigen::Matrix<double,2,1> obs;
                         kpUn = pKFi->mvKeysRight[rightIndex];
@@ -712,6 +733,7 @@ void Optimizer::FullInertialBA(Map *pMap, int its, const bool bFixLocal, const l
                         rk->setDelta(thHuberMono);
 
                         optimizer.addEdge(e);
+                        skFIBARearEdges++;
                     }
                 }
             }
@@ -723,6 +745,12 @@ void Optimizer::FullInertialBA(Map *pMap, int its, const bool bFixLocal, const l
             vbNotIncludedMP[i]=true;
         }
     }
+
+    // Per-camera edge audit (regression witness for the NLeft bounds fix:
+    // rear was silently 0 before it).
+    std::cout << "[AUDIT] FIBA edges: front " << skFIBAFrontEdges
+              << " rear " << skFIBARearEdges << std::endl;
+    skFIBAFrontEdges = skFIBARearEdges = 0;
 
     if(pbStopFlag)
         if(*pbStopFlag)
