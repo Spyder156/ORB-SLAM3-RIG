@@ -743,6 +743,12 @@ void System::DumpFrameKeypoints()
 {
     if(!mKpDump.is_open()) return;
     Frame &F = mpTracker->mCurrentFrame;
+    // After a map reset mCurrentFrame is a default Frame(): N holds stale
+    // garbage while the keypoint vectors are empty. Indexing them segfaulted
+    // (gdb: DumpFrameKeypoints, first frame after CreateMapInAtlas).
+    const int nAvail = (F.Nleft == -1) ? (int)F.mvKeysUn.size()
+                                       : (int)(F.mvKeys.size() + F.mvKeysRight.size());
+    if(F.N <= 0 || F.N > nAvail) return;
     const int nL = (F.Nleft == -1) ? (int)F.mvKeys.size() : F.Nleft;
     for(int i = 0; i < F.N; i++)
     {
