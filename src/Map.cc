@@ -321,6 +321,11 @@ void Map::ApplyScaledRotation(const Sophus::SE3f &T, const float s, const bool b
             if(pML && !pML->isBad())
                 pML->ApplyScaledRotation(Ryw, s, tyw);
     }
+    // Pending line tracks in Tracking store their anchor pose stamped with
+    // GetWorldFrameVersion(); this bump is what tells them the world moved.
+    // It was never incremented -- the staleness check was dead code and
+    // anchors crossed scale/gravity re-expressions silently.
+    mnWorldFrameVersion++;
     mnMapChange++;
 }
 
