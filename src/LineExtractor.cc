@@ -145,7 +145,13 @@ std::vector<LineObs> LineExtractor::MergeGreatCircles(
         while (g0 < pieces.size()) {
             float lo = pieces[g0].lo, hi = pieces[g0].hi;
             float wSum = hi - lo;
-            Eigen::Vector3f nAcc = in[pieces[g0].idx].n * (hi - lo);
+            // Sign-align EVERY normal to n0, including the group's first: a
+            // line has no orientation, so a fragment detected with reversed
+            // endpoint order carries -n. Accumulating the first one unaligned
+            // let one reversed seed cancel the others (measured 89.9 deg
+            // normal error from fragments that agree to 0.2 deg).
+            const Eigen::Vector3f n00 = in[pieces[g0].idx].n;
+            Eigen::Vector3f nAcc = (n00.dot(n0) < 0.f ? -n00 : n00) * (hi - lo);
             size_t g1 = g0 + 1;
             for (; g1 < pieces.size(); ++g1) {
                 const float gap = pieces[g1].lo - hi;
@@ -162,8 +168,17 @@ std::vector<LineObs> LineExtractor::MergeGreatCircles(
             Eigen::Vector3f nm = nAcc / std::max(wSum, 1e-9f);
             if (nm.norm() < 1e-7f) nm = n0; else nm.normalize();
             m.n = nm;
-            m.b1u = (u * std::cos(lo) + v * std::sin(lo)).normalized();
-            m.b2u = (u * std::cos(hi) + v * std::sin(hi)).normalized();
+            // ONE consistent plane: the endpoints must lie on the plane of the
+            // MERGED normal, not the seed's. Re-derive the in-plane basis on
+            // nm (seed basis projected onto nm's plane), so nm.b1u == 0 by
+            // construction -- previously the stored normal and the stored
+            // bearings described two different planes.
+            Eigen::Vector3f um = u - nm * nm.dot(u);
+            if (um.norm() < 1e-6f) um = u;   // ~coincident planes: keep seed basis
+            um.normalize();
+            const Eigen::Vector3f vm = nm.cross(um);
+            m.b1u = (um * std::cos(lo) + vm * std::sin(lo)).normalized();
+            m.b2u = (um * std::cos(hi) + vm * std::sin(hi)).normalized();
             m.angLen = hi - lo;
             Eigen::Vector3f dd = m.b2u - m.b1u;
             if (dd.norm() > 1e-9f) m.dir = dd.normalized();
