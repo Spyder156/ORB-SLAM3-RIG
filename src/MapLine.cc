@@ -290,7 +290,7 @@ bool MapLine::RefitFromPoints(float inlierTol, int minInliers, float minSpan) {
         }
         mvpSupport.swap(keep);
     }
-    if ((int)P.size() < minInliers) return false;
+    if ((int)P.size() < minInliers) { mbSupportFitOk = false; return false; }
 
     // best collinear pair (points share a great circle without sharing an
     // edge -- e.g. near wall + through a doorway -- so a plain PCA over all
@@ -307,8 +307,8 @@ bool MapLine::RefitFromPoints(float inlierTol, int minInliers, float minSpan) {
                 if ((X - P[i]).cross(d).norm() < inlierTol) nin++;
             if (nin > bestIn) { bestIn = nin; bi = int(i); bj = int(j); }
         }
-    if (bi < 0 || bestIn < minInliers) { mnFitFail++; return false; }
-    if (float(bestIn) < 0.6f * float(P.size())) { mnFitFail++; return false; }
+    if (bi < 0 || bestIn < minInliers) { mnFitFail++; mbSupportFitOk = false; return false; }
+    if (float(bestIn) < 0.6f * float(P.size())) { mnFitFail++; mbSupportFitOk = false; return false; }
     mnFitFail = 0;
 
     Eigen::Vector3f d0 = (P[bj] - P[bi]).normalized();
@@ -333,8 +333,9 @@ bool MapLine::RefitFromPoints(float inlierTol, int minInliers, float minSpan) {
         const float t = (X - c).dot(d);
         tmin = std::min(tmin, t); tmax = std::max(tmax, t);
     }
-    if (!(tmax - tmin >= minSpan)) return false;
+    if (!(tmax - tmin >= minSpan)) { mbSupportFitOk = false; return false; }
     SetEndpoints(c + d * tmin, c + d * tmax);
+    mbSupportFitOk = true;
     return true;
 }
 

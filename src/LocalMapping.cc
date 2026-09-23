@@ -388,10 +388,14 @@ void LocalMapping::RetriangulateLines()
     int nTried = 0, nImproved = 0; double gainSum = 0.0;
     for(MapLine* pML : sLines)
     {
-        if(pML->SupportCount() >= 2){        // point-supported: geometry rides
-            pML->RefitFromPoints();          // the points, never the planes
+        // Point-supported: geometry rides the points -- but ONLY while the fit
+        // actually succeeds. Gating on the count alone made 2-support lines a
+        // dead end (blocked from plane repair here, unable to reach the
+        // 3-point consensus there) and let a FAILED fit veto reconstruction.
+        if(pML->SupportCount() >= 3 && pML->RefitFromPoints())
             continue;
-        }
+        if(pML->mbSupportFitOk)              // last fit still valid: keep it
+            continue;
         // gather this landmark's observations, each as a world-frame plane
         struct Ob { Eigen::Vector3f nw, nc, t; Eigen::Matrix3f R; Eigen::Vector3f b1, b2; };
         std::vector<Ob> obs;
@@ -419,13 +423,39 @@ void LocalMapping::RetriangulateLines()
                 if(a > best){ best = a; bi = (int)i; bj = (int)j; }
             }
         if(bi < 0) continue;
-        // only bother when it genuinely beats what the landmark was built from
-        if(best < 1.2f * pML->mCreateParallax) continue;
+
+        // Repair is RESIDUAL-driven, not parallax-driven. Pose updates (VIBA,
+        // local BA, loop close) move keyframes while the line stays put; the
+        // old gate ("re-solve only on parallax wider than at creation")
+        // compared against a stamp from a DIFFERENT world state and blocked
+        // exactly that repair -- measured: a 4-KF line missing all its
+        // observations by ~10 deg whose own first/last pair reconstructs it
+        // to 0.1 deg. maxResid: worst angular distance [rad] of any observed
+        // endpoint bearing from the line's predicted great circle.
+        auto maxResid = [&](const Eigen::Vector3f& d, const Eigen::Vector3f& m){
+            float worst = 0.f;
+            for(const Ob& ob : obs){
+                const Eigen::Vector3f d_c = ob.R * d;
+                const Eigen::Vector3f m_c = ob.R * m + ob.t.cross(d_c);
+                if(m_c.norm() < 1e-9f) return 1e9f;   // through a camera centre
+                const Eigen::Vector3f n_c = m_c.normalized();
+                for(const Eigen::Vector3f& b : {ob.b1, ob.b2})
+                    worst = std::max(worst,
+                        std::asin(std::min(1.f, std::fabs(n_c.dot(b)))));
+            }
+            return worst;
+        };
+        const float residOld = maxResid(pML->GetDirection(), pML->GetMoment());
+        if(residOld < 0.006f) continue;   // ~0.35 deg: still explains every obs
 
         Eigen::Vector3f dw, mw;
         if(!MapLine::Triangulate(obs[bi].nc, obs[bi].R, obs[bi].t,
                                  obs[bj].nc, obs[bj].R, obs[bj].t,
                                  2.0f, dw, mw)) continue;
+
+        // the re-solve must actually explain the observations better
+        const float residNew = maxResid(dw, mw);
+        if(residNew > 0.5f * residOld && residNew > 0.006f) continue;
 
         // must still explain BOTH source observations at positive depth
         bool ok = true;

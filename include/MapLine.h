@@ -159,6 +159,12 @@ public:
     /// reach consensus is a mixture of different physical edges; the landmark
     /// is deleted after a few strikes (see Tracking support pass).
     int mnFitFail = 0;
+    /// True iff the LAST RefitFromPoints reached a >=3-point consensus. This,
+    /// not the raw support COUNT, is what "the points own the geometry" means:
+    /// gating on count alone froze 2-support lines in a dead zone (too
+    /// supported for plane re-triangulation, too few points for the fit) and
+    /// let failed fits block geometric repair.
+    bool mbSupportFitOk = false;
 
     /// First observation (plane normal + lens pose), kept so the line can be
     /// RE-TRIANGULATED against later, wider-baseline observations -- the
