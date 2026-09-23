@@ -1986,14 +1986,13 @@ Sophus::SE3f Tracking::GrabImageMonoRig(const cv::Mat &im0, const cv::Mat &im1,
                             Tc.rotationMatrix(), Tc.translation(), cur.b1u);
                         const float r2 = cur.pML->AngularError(
                             Tc.rotationMatrix(), Tc.translation(), cur.b2u);
-                        // direction + cheirality on reuse
+                        // Cheirality on reuse. (A chord-vs-direction gate used
+                        // to sit here too; it compared the 3D direction with
+                        // normalize(b2-b1), which differ whenever the endpoint
+                        // DEPTHS differ -- a perfect synthetic line failed it
+                        // by 58 deg. The plane residual r1/r2 above is the
+                        // valid projected-curve check; the chord gate is gone.)
                         bool behind = false;
-                        {
-                            const Eigen::Vector3f d_chk =
-                                Tc.rotationMatrix() * cur.pML->GetDirection();
-                            if(std::fabs(d_chk.dot(cur.dir)) < 0.9659f)
-                                behind = true;    // direction contradicts obs
-                        }
                         {
                             const Eigen::Vector3f d_c =
                                 Tc.rotationMatrix() * cur.pML->GetDirection();
@@ -2010,6 +2009,11 @@ Sophus::SE3f Tracking::GrabImageMonoRig(const cv::Mat &im0, const cv::Mat &im1,
                         }
                         if(behind || std::max(r1, r2) > mfLineReobsMaxRad){
                             cur.pML = nullptr;    // track drifted off the line
+                            // the inheritance pass (above) already wrote this
+                            // association into mvpMapLines; a rejection must
+                            // clear BOTH or the keyframe commits the rejected
+                            // binding
+                            mCurrentFrame.mvpMapLines[i] = nullptr;
                             nRej++;
                             continue;
                         }
@@ -2029,7 +2033,7 @@ Sophus::SE3f Tracking::GrabImageMonoRig(const cv::Mat &im0, const cv::Mat &im1,
                             // parity) -- the 2-view solve must not overwrite
                             // the BA estimate.
                             if(pL->mbHasFirst && pL->Observations() < 2
-                               && pL->SupportCount() < 2){
+                               && !pL->mbSupportFitOk){
                                 const Eigen::Vector3f n1w =
                                     Tc.rotationMatrix().transpose() * cur.n;
                                 const Eigen::Vector3f n2w =
@@ -2047,8 +2051,18 @@ Sophus::SE3f Tracking::GrabImageMonoRig(const cv::Mat &im0, const cv::Mat &im1,
                                         const Eigen::Vector3f m_c2 =
                                             Tc.rotationMatrix() * mw2
                                             + Tc.translation().cross(d_c2);
-                                        bool ok2 =
-                                            std::fabs(d_c2.dot(cur.dir)) >= 0.9659f;
+                                        // plane agreement, not the (invalid)
+                                        // chord-direction comparison: the
+                                        // re-solved line's interpretation
+                                        // plane (normal ~ m_c2) must contain
+                                        // the observed endpoint bearings.
+                                        bool ok2 = m_c2.norm() > 1e-6f;
+                                        if(ok2){
+                                            const Eigen::Vector3f n_c2 =
+                                                m_c2.normalized();
+                                            ok2 = std::fabs(n_c2.dot(cur.b1u)) < 0.0175f
+                                               && std::fabs(n_c2.dot(cur.b2u)) < 0.0175f;
+                                        }
                                         for(const Eigen::Vector3f& b :
                                                 {cur.b1u, cur.b2u}){
                                             const Eigen::Vector3f cr = b.cross(d_c2);
@@ -2076,7 +2090,8 @@ Sophus::SE3f Tracking::GrabImageMonoRig(const cv::Mat &im0, const cv::Mat &im1,
                         }
                         nObs++;
                     } else {
-                        cur.pML = nullptr;
+                        cur.pML = nullptr;                    // landmark went bad
+                        mCurrentFrame.mvpMapLines[i] = nullptr; // keep containers in sync
                     }
                     continue;
                 }
@@ -2171,7 +2186,12 @@ Sophus::SE3f Tracking::GrabImageMonoRig(const cv::Mat &im0, const cv::Mat &im1,
                         // So: find the largest subset of the on-circle points
                         // that really is collinear in 3D, and require it to be
                         // depth-consistent.
-                        if(nOn >= 2){
+                        // >= 3 agreeing points, same bar as RefitFromPoints: a
+                        // pair defines a line with itself as its only inliers
+                        // (two points near one image edge do not establish its
+                        // depth), and birth-at-2 fed landmarks that the >= 3
+                        // refit could then never repair.
+                        if(nOn >= 3){
                             int bi = -1, bj = -1, bestIn = 0;
                             for(size_t q1 = 0; q1 < onPts.size(); q1++)
                               for(size_t q2 = q1 + 1; q2 < onPts.size(); q2++){
@@ -2184,7 +2204,7 @@ Sophus::SE3f Tracking::GrabImageMonoRig(const cv::Mat &im0, const cv::Mat &im1,
                                     if((X - onPts[q1]).cross(dc).norm() < mfLinePtInlier) nin++;
                                 if(nin > bestIn){ bestIn = nin; bi = int(q1); bj = int(q2); }
                               }
-                            if(bi >= 0 && bestIn >= 2){
+                            if(bi >= 0 && bestIn >= 3){
                                 Eigen::Vector3f d = onPts[bj] - onPts[bi];
                                 d.normalize();
                                 // depth consistency: a line running from just in
@@ -2219,21 +2239,14 @@ Sophus::SE3f Tracking::GrabImageMonoRig(const cv::Mat &im0, const cv::Mat &im1,
                                          2.0f, dw, mw))
                     continue;      // still too little angle -- keep accumulating
 
-                {   // DIRECTION GATE. The residual n.b constrains only the
-                    // PLANE; the direction d inside it is unchecked anywhere
-                    // (the aperture problem), and at ~2 deg parallax
-                    // d = n1 x n2 is noise-dominated. But the OBSERVED chord
-                    // b2-b1 lies in the same plane and points along the real
-                    // line, so the triangulated direction must agree with it.
-                    // Measured before this gate: 8.6% of dumped lines were
-                    // >5 m long and 79% of those ran along the view ray --
-                    // random directions exploding the bearing-intersection.
-                    const Eigen::Vector3f d_chk = Tc.rotationMatrix() * dw;
-                    if(!bFromPoints && std::fabs(d_chk.dot(cur.dir)) < 0.9659f){  // > 15 deg off
-                        nRej++;
-                        continue;
-                    }
-                }
+                // (The former DIRECTION GATE -- triangulated direction vs the
+                // observed chord normalize(b2-b1) -- was mathematically
+                // invalid: those directions differ whenever the endpoint
+                // depths differ, and a perfect synthetic line failed it by
+                // 58 deg. Its real job, killing noise-dominated view-ray
+                // solutions, is done by the RANGE check inside the cheirality
+                // gate below: a view-ray line intersects its own bearings at
+                // exploding depth.)
                 {   // CHEIRALITY GATE. Two interpretation planes meet in
                     // exactly one line; if that line is where the camera looked
                     // it intersects both observed bearings at POSITIVE depth.
@@ -2252,7 +2265,12 @@ Sophus::SE3f Tracking::GrabImageMonoRig(const cv::Mat &im0, const cv::Mat &im1,
                     for(const Eigen::Vector3f& b : {cur.b1u, cur.b2u}){
                         const Eigen::Vector3f cr = b.cross(d_c);
                         const float den = cr.squaredNorm();
-                        if(den < 1e-10f || m_c.dot(cr)/den <= 0.f) neg++;
+                        // s: depth [m] of the endpoint along bearing b.
+                        // s <= 0 is a mirror solution; s > 30 m indoors is a
+                        // noise-dominated view-ray line (the failure the old
+                        // chord gate was aimed at, checked validly here).
+                        const float s = den < 1e-10f ? -1.f : m_c.dot(cr)/den;
+                        if(s <= 0.f || s > 30.f) neg++;
                     }
                     audCheirTot++;
                     if(neg > 0){ audCheirNeg++; nRej++; continue; }
