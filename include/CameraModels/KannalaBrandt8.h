@@ -106,7 +106,7 @@ namespace ORB_SLAM3 {
 
         TwoViewReconstruction* tvr;
 
-        void Triangulate(const cv::Point2f &p1, const cv::Point2f &p2, const Eigen::Matrix<float,3,4> &Tcw1,
+        void Triangulate(const cv::Point3f &r1, const cv::Point3f &r2, const Eigen::Matrix<float,3,4> &Tcw1,
                          const Eigen::Matrix<float,3,4> &Tcw2, Eigen::Vector3f &x3D);
     };
 }

@@ -114,32 +114,38 @@ namespace ORB_SLAM3 {
     }
 
     cv::Point3f KannalaBrandt8::unproject(const cv::Point2f &p2D) {
-        //Use Newthon method to solve for theta with good precision (err ~ e-6)
+        // SPHERICAL inverse: returns the UNIT bearing (sin(theta)*dir, cos(theta)).
+        //
+        // The upstream form returned a z=1 ray scaled by tan(theta), clamping
+        // theta_d to pi/2. On a fisheye seeing past 90 deg that is wrong twice:
+        // tan flips sign beyond 90 (a rim pixel round-tripped 1427 px away),
+        // and the clamp corrupts everything near the rim. Kannala-Brandt is
+        // defined on theta in [0, FOV/2]; the bearing form is valid on the
+        // whole calibrated domain. Callers were audited for the z=1
+        // assumption: MLPnP (now normalises), the two DLT triangulators (now
+        // general-ray), LineExtractor (always normalised).
         cv::Point2f pw((p2D.x - mvParameters[2]) / mvParameters[0], (p2D.y - mvParameters[3]) / mvParameters[1]);
-        float scale = 1.f;
-        float theta_d = sqrtf(pw.x * pw.x + pw.y * pw.y);
-        theta_d = fminf(fmaxf(-CV_PI / 2.f, theta_d), CV_PI / 2.f);
+        const float theta_d = sqrtf(pw.x * pw.x + pw.y * pw.y);
 
-        if (theta_d > 1e-8) {
-            //Compensate distortion iteratively
-            float theta = theta_d;
+        if (theta_d <= 1e-8f)
+            return cv::Point3f(0.f, 0.f, 1.f);
 
-            for (int j = 0; j < 10; j++) {
-                float theta2 = theta * theta, theta4 = theta2 * theta2, theta6 = theta4 * theta2, theta8 =
-                        theta4 * theta4;
-                float k0_theta2 = mvParameters[4] * theta2, k1_theta4 = mvParameters[5] * theta4;
-                float k2_theta6 = mvParameters[6] * theta6, k3_theta8 = mvParameters[7] * theta8;
-                float theta_fix = (theta * (1 + k0_theta2 + k1_theta4 + k2_theta6 + k3_theta8) - theta_d) /
-                                  (1 + 3 * k0_theta2 + 5 * k1_theta4 + 7 * k2_theta6 + 9 * k3_theta8);
-                theta = theta - theta_fix;
-                if (fabsf(theta_fix) < precision)
-                    break;
-            }
-            //scale = theta - theta_d;
-            scale = std::tan(theta) / theta_d;
+        // Newton for theta (err ~ e-6); allow up to ~108 deg, past any real FOV/2
+        float theta = fminf(theta_d, 0.6f * float(CV_PI));
+        for (int j = 0; j < 10; j++) {
+            float theta2 = theta * theta, theta4 = theta2 * theta2, theta6 = theta4 * theta2, theta8 =
+                    theta4 * theta4;
+            float k0_theta2 = mvParameters[4] * theta2, k1_theta4 = mvParameters[5] * theta4;
+            float k2_theta6 = mvParameters[6] * theta6, k3_theta8 = mvParameters[7] * theta8;
+            float theta_fix = (theta * (1 + k0_theta2 + k1_theta4 + k2_theta6 + k3_theta8) - theta_d) /
+                              (1 + 3 * k0_theta2 + 5 * k1_theta4 + 7 * k2_theta6 + 9 * k3_theta8);
+            theta = theta - theta_fix;
+            theta = fminf(fmaxf(theta, 0.f), 0.6f * float(CV_PI));
+            if (fabsf(theta_fix) < precision)
+                break;
         }
-
-        return cv::Point3f(pw.x * scale, pw.y * scale, 1.f);
+        const float s = std::sin(theta) / theta_d;   // in-plane direction scale
+        return cv::Point3f(pw.x * s, pw.y * s, std::cos(theta));
     }
 
     Eigen::Matrix<double, 2, 3> KannalaBrandt8::projectJac(const Eigen::Vector3d &v3D) {
@@ -248,17 +254,9 @@ namespace ORB_SLAM3 {
         }
 
         //Parallax is good, so we try to triangulate
-        cv::Point2f p11,p22;
-
-        p11.x = ray1c.x;
-        p11.y = ray1c.y;
-
-        p22.x = ray2c.x;
-        p22.y = ray2c.y;
-
         Eigen::Vector3f x3D;
 
-        Triangulate(p11,p22,eigTcw1,eigTcw2,x3D);
+        Triangulate(ray1c,ray2c,eigTcw1,eigTcw2,x3D);
 
         //Check triangulation in front of cameras
         float z1 = Rcw1.row(2).dot(x3D)+Tcw1.translation()(2);
@@ -318,13 +316,7 @@ namespace ORB_SLAM3 {
         }
 
         //Parallax is good, so we try to triangulate
-        cv::Point2f p11,p22;
-
-        p11.x = r1[0];
-        p11.y = r1[1];
-
-        p22.x = r2[0];
-        p22.y = r2[1];
+        const cv::Point3f p11(r1[0], r1[1], r1[2]), p22(r2[0], r2[1], r2[2]);
 
         Eigen::Vector3f x3D;
         Eigen::Matrix<float,3,4> Tcw1;
@@ -391,14 +383,16 @@ namespace ORB_SLAM3 {
         return is;
     }
 
-    void KannalaBrandt8::Triangulate(const cv::Point2f &p1, const cv::Point2f &p2, const Eigen::Matrix<float,3,4> &Tcw1,
+    void KannalaBrandt8::Triangulate(const cv::Point3f &r1, const cv::Point3f &r2, const Eigen::Matrix<float,3,4> &Tcw1,
                                      const Eigen::Matrix<float,3,4> &Tcw2, Eigen::Vector3f &x3D)
     {
+        // general-ray DLT (rays of any z, spherical bearings included);
+        // (u,v,1) rays reproduce the old rows exactly
         Eigen::Matrix<float,4,4> A;
-        A.row(0) = p1.x*Tcw1.row(2)-Tcw1.row(0);
-        A.row(1) = p1.y*Tcw1.row(2)-Tcw1.row(1);
-        A.row(2) = p2.x*Tcw2.row(2)-Tcw2.row(0);
-        A.row(3) = p2.y*Tcw2.row(2)-Tcw2.row(1);
+        A.row(0) = r1.x*Tcw1.row(2)-r1.z*Tcw1.row(0);
+        A.row(1) = r1.y*Tcw1.row(2)-r1.z*Tcw1.row(1);
+        A.row(2) = r2.x*Tcw2.row(2)-r2.z*Tcw2.row(0);
+        A.row(3) = r2.y*Tcw2.row(2)-r2.z*Tcw2.row(1);
 
         Eigen::JacobiSVD<Eigen::Matrix4f> svd(A, Eigen::ComputeFullV);
         Eigen::Vector4f x3Dh = svd.matrixV().col(3);

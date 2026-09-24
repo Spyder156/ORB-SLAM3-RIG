@@ -46,11 +46,15 @@ Eigen::Matrix3f GeometricTools::ComputeF12(KeyFrame* &pKF1, KeyFrame* &pKF2)
 
 bool GeometricTools::Triangulate(Eigen::Vector3f &x_c1, Eigen::Vector3f &x_c2,Eigen::Matrix<float,3,4> &Tc1w ,Eigen::Matrix<float,3,4> &Tc2w , Eigen::Vector3f &x3D)
 {
+    // General-ray DLT: rows come from  x_c x (T X) = 0  for a ray x_c of ANY
+    // scale/sign of z -- (u,v,1) rays give exactly the old rows, spherical
+    // bearings (fisheye, |theta| possibly > 90 deg) are now handled instead of
+    // being silently treated as z=1.
     Eigen::Matrix4f A;
-    A.block<1,4>(0,0) = x_c1(0) * Tc1w.block<1,4>(2,0) - Tc1w.block<1,4>(0,0);
-    A.block<1,4>(1,0) = x_c1(1) * Tc1w.block<1,4>(2,0) - Tc1w.block<1,4>(1,0);
-    A.block<1,4>(2,0) = x_c2(0) * Tc2w.block<1,4>(2,0) - Tc2w.block<1,4>(0,0);
-    A.block<1,4>(3,0) = x_c2(1) * Tc2w.block<1,4>(2,0) - Tc2w.block<1,4>(1,0);
+    A.block<1,4>(0,0) = x_c1(0) * Tc1w.block<1,4>(2,0) - x_c1(2) * Tc1w.block<1,4>(0,0);
+    A.block<1,4>(1,0) = x_c1(1) * Tc1w.block<1,4>(2,0) - x_c1(2) * Tc1w.block<1,4>(1,0);
+    A.block<1,4>(2,0) = x_c2(0) * Tc2w.block<1,4>(2,0) - x_c2(2) * Tc2w.block<1,4>(0,0);
+    A.block<1,4>(3,0) = x_c2(1) * Tc2w.block<1,4>(2,0) - x_c2(2) * Tc2w.block<1,4>(1,0);
 
     Eigen::JacobiSVD<Eigen::Matrix4f> svd(A, Eigen::ComputeFullV);
 

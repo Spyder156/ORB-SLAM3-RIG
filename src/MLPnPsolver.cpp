@@ -74,9 +74,12 @@ namespace ORB_SLAM3 {
                     mvP2D.push_back(kp.pt);
                     mvSigma2.push_back(F.mvLevelSigma2[kp.octave]);
 
-                    //Bearing vector should be normalized
+                    //Bearing vector should be normalized -- by its NORM.
+                    //Dividing by z assumed the old z=1 inverse and re-created
+                    //the tan() reversal for bearings past 90 deg.
                     cv::Point3f cv_br = mpCamera->unproject(kp.pt);
-                    cv_br /= cv_br.z;
+                    const float brn = std::sqrt(cv_br.x*cv_br.x + cv_br.y*cv_br.y + cv_br.z*cv_br.z);
+                    cv_br /= (brn > 1e-9f ? brn : 1.f);
                     bearingVector_t br(cv_br.x,cv_br.y,cv_br.z);
                     mvBearingVecs.push_back(br);
 
