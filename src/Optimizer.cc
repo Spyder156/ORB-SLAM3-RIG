@@ -2932,7 +2932,7 @@ void Optimizer::LocalInertialBA(KeyFrame *pKF, bool *pbStopFlag, Map *pMap, int&
         // point cloud, which BA is already refining. Their edges still
         // constrain the poses.
         const bool bDetermined = (vUsable.size() >= LINE_BA_MIN_OBS)
-                                 && (pML->SupportCount() < 2);
+                                 && !pML->mbSupportFitOk;
 
         Eigen::Vector3f vS, vE; pML->GetEndpoints(vS, vE);
         VertexLine* vLine = new VertexLine(vS, vE);
@@ -2948,7 +2948,7 @@ void Optimizer::LocalInertialBA(KeyFrame *pKF, bool *pbStopFlag, Map *pMap, int&
             const LineObs &lo = pKFi->mvLines[vUsable[k].second];
 
             const float f0 = pKFi->mpCamera ? pKFi->mpCamera->getParameter(0) : 400.f;
-            EdgeLine* el = new EdgeLine(lo.n, f0, lo.cam);
+            EdgeLine* el = new EdgeLine(lo.b1u, lo.b2u, f0, lo.cam);
             el->setVertex(0, dynamic_cast<g2o::OptimizableGraph::Vertex*>(vLine));
             el->setVertex(1, dynamic_cast<g2o::OptimizableGraph::Vertex*>(optimizer.vertex(pKFi->mnId)));
             el->setMeasurement(Eigen::Vector3d::Zero());
@@ -3118,7 +3118,7 @@ void Optimizer::LocalInertialBA(KeyFrame *pKF, bool *pbStopFlag, Map *pMap, int&
     for(list<MapLine*>::iterator lit=lLocalMapLines.begin(), lend=lLocalMapLines.end(); lit!=lend; lit++)
     {
         MapLine* pML = *lit;
-        if(pML && !pML->isBad() && pML->SupportCount() >= 2)
+        if(pML && !pML->isBad() && pML->SupportCount() >= 3)
             pML->RefitFromPoints();
     }
 
@@ -4942,7 +4942,7 @@ int Optimizer::PoseInertialOptimizationLastKeyFrame(Frame *pFrame, bool bRecInit
             const LineObs &lo = pFrame->mvLines[i];
             Eigen::Vector3f eS, eE; pML->GetEndpoints(eS, eE);
             EdgeLineOnlyPose* el = new EdgeLineOnlyPose(
-                eS, eE, lo.n, f0, lo.cam, pML->mCreateParallax);
+                eS, eE, lo.b1u, lo.b2u, f0, lo.cam, pML->mCreateParallax);
             el->setVertex(0, VP);
             el->setMeasurement(Eigen::Vector2d::Zero());
             el->setInformation(Eigen::Matrix2d::Identity() * infoLineK);
@@ -5386,7 +5386,7 @@ int Optimizer::PoseInertialOptimizationLastFrame(Frame *pFrame, bool bRecInit)
             if(pML->mnValidated < 2) continue;   // FIX 4: probation (below)
             Eigen::Vector3f eS, eE; pML->GetEndpoints(eS, eE);
             EdgeLineOnlyPose* el = new EdgeLineOnlyPose(
-                eS, eE, lo.n, f0, lo.cam, pML->mCreateParallax);
+                eS, eE, lo.b1u, lo.b2u, f0, lo.cam, pML->mCreateParallax);
             el->setVertex(0, VP);
             el->setMeasurement(Eigen::Vector2d::Zero());
             // FIX 3: the landmark is NOT noiseless. Its plane was triangulated

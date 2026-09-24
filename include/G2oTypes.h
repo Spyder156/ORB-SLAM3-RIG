@@ -356,18 +356,37 @@ public:
  * an edge is fitting noise -- that is the aperture problem, and it is why the
  * endpoints are used only as bearings ON the plane, never as matched points.
  */
-/// Angular distance [rad] of an endpoint, seen at X_c, from the OBSERVED great
-/// circle with unit normal n_obs. The measurement (n_obs) comes straight from
-/// the detector and is constant; the PREDICTION is the endpoint's bearing.
-/// That ordering is the whole fix -- nothing that varies gets normalised by a
-/// quantity that can go to zero. Sliding an endpoint ALONG the line leaves the
-/// bearing on the same great circle, so this stays aperture-safe.
-inline double LineEndpointResidual(const Eigen::Vector3d &n_obs,
-                                   const Eigen::Vector3d &X_c)
+/// Residual of one observation against the PREDICTED line: the two OBSERVED
+/// endpoint bearings vs the plane spanned by the camera centre and the
+/// predicted endpoints (n_c = S_c x E_c, i.e. m_c of the predicted line about
+/// this camera). Two rows [px].
+///
+/// The previous form was BACKWARDS -- predicted endpoints vs the observed
+/// plane: a wrong line pointing at the camera projects to a stub whose
+/// endpoints hug the observed circle and score ~zero (line 18207: 112 px
+/// detected edge, 3.4 px stub, 1.5 px "error", truly 12 deg off). Checking
+/// the observed bearings against the predicted plane has no such escape:
+/// the stub's plane misses the observed edge by exactly its real error.
+///
+/// Degenerate predicted plane (segment through the camera centre) scores
+/// MAXIMUM, never zero -- a zero there is the documented zero-cost failure.
+/// Sliding endpoints ALONG the line leaves the plane unchanged, so this is
+/// still aperture-safe; that slide stays gauge, handled outside BA.
+inline Eigen::Vector2d LinePlaneResidual(const Eigen::Vector3d &b1_obs,
+                                         const Eigen::Vector3d &b2_obs,
+                                         const Eigen::Vector3d &S_c,
+                                         const Eigen::Vector3d &E_c,
+                                         double f)
 {
-    const double r = X_c.norm();
-    if (r < 1e-9) return 0.0;               // guarded by cheirality, not here
-    return std::asin(std::max(-1.0, std::min(1.0, n_obs.dot(X_c) / r)));
+    const Eigen::Vector3d n = S_c.cross(E_c);
+    const double nn = n.norm();
+    if (nn < 1e-12)
+        return Eigen::Vector2d(f * M_PI / 2.0, f * M_PI / 2.0);
+    const Eigen::Vector3d nu = n / nn;
+    auto r = [&](const Eigen::Vector3d &b) {
+        return f * std::asin(std::max(-1.0, std::min(1.0, nu.dot(b))));
+    };
+    return Eigen::Vector2d(r(b1_obs), r(b2_obs));
 }
 
 class EdgeLineOnlyPose : public g2o::BaseUnaryEdge<2, Eigen::Vector2d, VertexPose>
@@ -376,13 +395,14 @@ public:
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 
     /// e1_w/e2_w: the landmark's two ENDPOINTS in the world frame (fixed here).
-    /// n_obs: the observed interpretation-plane unit normal in the OBSERVING
-    /// lens frame. focal: pixels per radian, so the residual is in pixels.
+    /// b1/b2: the OBSERVED endpoint unit bearings in the OBSERVING lens frame
+    /// (the measurement). focal: pixels per radian, residual in pixels.
     EdgeLineOnlyPose(const Eigen::Vector3f &e1_w, const Eigen::Vector3f &e2_w,
-                     const Eigen::Vector3f &n_obs, float focal,
-                     int cam_idx_ = 0, float createParallax = 0.f)
+                     const Eigen::Vector3f &b1_obs, const Eigen::Vector3f &b2_obs,
+                     float focal, int cam_idx_ = 0, float createParallax = 0.f)
         : Sw(e1_w.cast<double>()), Ew(e2_w.cast<double>()),
-          nobs(n_obs.cast<double>().normalized()), f(double(focal)),
+          b1(b1_obs.cast<double>().normalized()),
+          b2(b2_obs.cast<double>().normalized()), f(double(focal)),
           cam_idx(cam_idx_), parallax(createParallax) {}
 
     virtual bool read(std::istream &is) { return false; }
@@ -395,8 +415,7 @@ public:
         const Eigen::Vector3d &tcw = VP->estimate().tcw[cam_idx];
         const Eigen::Vector3d S_c = Rcw * Sw + tcw;
         const Eigen::Vector3d E_c = Rcw * Ew + tcw;
-        _error << f * LineEndpointResidual(nobs, S_c),
-                  f * LineEndpointResidual(nobs, E_c);
+        _error = LinePlaneResidual(b1, b2, S_c, E_c, f);
     }
 
     /// Both endpoints in front of this lens.
@@ -408,7 +427,7 @@ public:
         return (Rcw * Sw + tcw)(2) > 0.05 && (Rcw * Ew + tcw)(2) > 0.05;
     }
 
-    Eigen::Vector3d Sw, Ew, nobs;
+    Eigen::Vector3d Sw, Ew, b1, b2;
     double f;
     int cam_idx;
     float parallax = 0.f;   ///< creation parallax [rad]
@@ -529,8 +548,11 @@ class EdgeLine : public g2o::BaseBinaryEdge<2, Eigen::Vector3d, VertexLine, Vert
 public:
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 
-    EdgeLine(const Eigen::Vector3f &n_obs, float focal, int cam_idx_ = 0)
-        : nobs(n_obs.cast<double>().normalized()), f(double(focal)), cam_idx(cam_idx_) {}
+    EdgeLine(const Eigen::Vector3f &b1_obs, const Eigen::Vector3f &b2_obs,
+             float focal, int cam_idx_ = 0)
+        : b1(b1_obs.cast<double>().normalized()),
+          b2(b2_obs.cast<double>().normalized()),
+          f(double(focal)), cam_idx(cam_idx_) {}
 
     virtual bool read(std::istream &is) { return false; }
     virtual bool write(std::ostream &os) const { return false; }
@@ -543,8 +565,7 @@ public:
         const Eigen::Vector3d &tcw = VP->estimate().tcw[cam_idx];
         const Eigen::Vector3d S_c = Rcw * VL->estimate().head<3>() + tcw;
         const Eigen::Vector3d E_c = Rcw * VL->estimate().tail<3>() + tcw;
-        _error << f * LineEndpointResidual(nobs, S_c),
-                  f * LineEndpointResidual(nobs, E_c);
+        _error = LinePlaneResidual(b1, b2, S_c, E_c, f);
     }
 
     /// Both endpoints must be in front of this lens (what PLVS and
@@ -560,7 +581,7 @@ public:
         return S_c(2) > 0.05 && E_c(2) > 0.05;
     }
 
-    Eigen::Vector3d nobs;
+    Eigen::Vector3d b1, b2;
     double f;
     int cam_idx;
 };
