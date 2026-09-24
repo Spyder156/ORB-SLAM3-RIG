@@ -850,6 +850,12 @@ void System::SaveMapLines(const string &filename)
             numMax = pMap->GetAllKeyFrames().size(); pBiggerMap = pMap; }
     if(!pBiggerMap){ cout << "  no map to save" << endl; return; }
 
+    // Final consistency sweep, poses now final and all threads down: repair
+    // every line against its observations, DELETE what cannot be explained.
+    // Without this the saved map keeps lines whose keyframes moved after the
+    // last neighbourhood sweep -- the audit's worst offenders.
+    LocalMapping::RevalidateMapLines(pBiggerMap, true);
+
     // SAME FRAME AS THE POINTS AND THE TRAJECTORY (see SaveMapPoints).
     vector<KeyFrame*> vpKFsOrd = pBiggerMap->GetAllKeyFrames();
     sort(vpKFsOrd.begin(), vpKFsOrd.end(), KeyFrame::lId);

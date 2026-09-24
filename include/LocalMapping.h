@@ -43,6 +43,20 @@ class Atlas;
 class LocalMapping
 {
 public:
+    /// Map-wide line revalidation: for every line, does its stored geometry
+    /// still explain its observations? Repair (multiview, poses FIXED) or
+    /// delete. RetriangulateLines only sweeps the current KF neighbourhood,
+    /// so any line whose keyframes moved later (VIBA re-expression, global
+    /// BA) went stale with nothing left to re-check it -- the audit found
+    /// exactly those as the worst offenders in the SAVED map. Static: called
+    /// from LocalMapping after inertial re-initialisations and from System
+    /// right before the map is saved (threads already down there).
+    static void RevalidateMapLines(Map* pMap, bool bDelete);
+    /// The per-line core: residual over all observations, multiview repair
+    /// with fixed poses (conditioning-checked), fallback widest-pair solve.
+    /// Returns the line's final worst residual [rad] (1e9 if no usable obs).
+    static float RefineLineFromObservations(MapLine* pML);
+
     /// Lines.outlierCull / Lines.culling in the settings file (default on).
     /// Off isolates the residual change from the culling passes for A/B tests.
     static bool skLineOutlierCull;
@@ -147,6 +161,7 @@ protected:
     /// Without it a bad line landmark lives forever: it keeps being drawn,
     /// keeps entering BA and keeps voting on the pose.
     void MapLineCulling();
+
     /// PL-VINS `removeLineOutlier`: delete any line landmark whose WORST
     /// observation misses its own segment by more than ~3 px, or whose
     /// endpoints fall behind a camera / span an absurd length.

@@ -396,135 +396,150 @@ void LocalMapping::RetriangulateLines()
             continue;
         if(pML->mbSupportFitOk)              // last fit still valid: keep it
             continue;
-        // gather this landmark's observations, each as a world-frame plane
-        struct Ob { Eigen::Vector3f nw, nc, t; Eigen::Matrix3f R; Eigen::Vector3f b1, b2; };
-        std::vector<Ob> obs;
-        for(auto &o : pML->GetObservations())
-        {
-            KeyFrame* pK = o.first; const int idx = o.second;
-            if(!pK || pK->isBad() || idx < 0 || idx >= (int)pK->mvLines.size()) continue;
-            const LineObs &lo = pK->mvLines[idx];
-            Sophus::SE3f Tc = pK->GetPose();
-            if(lo.cam == 1 && pK->mpCamera2) Tc = pK->GetRelativePoseTrl() * Tc;
-            Ob ob; ob.R = Tc.rotationMatrix(); ob.t = Tc.translation();
-            ob.nc = lo.n; ob.nw = ob.R.transpose() * lo.n;
-            ob.b1 = lo.b1u; ob.b2 = lo.b2u;
-            obs.push_back(ob);
-        }
-        if(obs.size() < 2) continue;
         nTried++;
-
-        // WIDEST pair of interpretation planes
-        int bi = -1, bj = -1; float best = 0.f;
-        for(size_t i = 0; i < obs.size(); i++)
-            for(size_t j = i + 1; j < obs.size(); j++){
-                const float s = std::min(1.f, obs[i].nw.cross(obs[j].nw).norm());
-                const float a = std::asin(s);
-                if(a > best){ best = a; bi = (int)i; bj = (int)j; }
-            }
-        if(bi < 0) continue;
-
-        // Repair is RESIDUAL-driven, not parallax-driven. Pose updates (VIBA,
-        // local BA, loop close) move keyframes while the line stays put; the
-        // old gate ("re-solve only on parallax wider than at creation")
-        // compared against a stamp from a DIFFERENT world state and blocked
-        // exactly that repair -- measured: a 4-KF line missing all its
-        // observations by ~10 deg whose own first/last pair reconstructs it
-        // to 0.1 deg. maxResid: worst angular distance [rad] of any observed
-        // endpoint bearing from the line's predicted great circle.
-        auto maxResid = [&](const Eigen::Vector3f& d, const Eigen::Vector3f& m){
-            float worst = 0.f;
-            for(const Ob& ob : obs){
-                const Eigen::Vector3f d_c = ob.R * d;
-                const Eigen::Vector3f m_c = ob.R * m + ob.t.cross(d_c);
-                if(m_c.norm() < 1e-9f) return 1e9f;   // through a camera centre
-                const Eigen::Vector3f n_c = m_c.normalized();
-                for(const Eigen::Vector3f& b : {ob.b1, ob.b2})
-                    worst = std::max(worst,
-                        std::asin(std::min(1.f, std::fabs(n_c.dot(b)))));
-            }
-            return worst;
-        };
-        const float residOld = maxResid(pML->GetDirection(), pML->GetMoment());
-        if(residOld < 0.006f) continue;   // ~0.35 deg: still explains every obs
-
-        // MULTIVIEW refinement with the poses held FIXED. Every observation
-        // contributes its interpretation plane; the line direction is the
-        // common null direction of all the plane normals (smallest eigenvector
-        // of N = sum w n n^T -- n.d = 0 for every plane containing the line),
-        // and a point on the line satisfies n_k . (p - c_k) = 0 for every
-        // observation. A pair of planes 1.12 deg apart fails the 2-view 2 deg
-        // floor, but FOUR such planes jointly condition the same line (line
-        // 18207: multiview solve explains all obs to 0.067 deg). Conditioning
-        // is checked on the actual systems, not on a pairwise angle:
-        //   - direction: smallest eigenvalue of N well separated from the mid
-        //     one (his "direction stability")
-        //   - point: A = sum n n^T + d d^T must be invertible-well (the thin
-        //     sheaf case leaves depth unconstrained and MUST be rejected)
-        Eigen::Vector3f dw, mw;
-        bool solved = false;
-        if(obs.size() >= 3)
-        {
-            Eigen::Matrix3f N = Eigen::Matrix3f::Zero();
-            for(const Ob& ob : obs) N += ob.nw * ob.nw.transpose();
-            Eigen::SelfAdjointEigenSolver<Eigen::Matrix3f> esN(N);
-            const Eigen::Vector3f ev = esN.eigenvalues();   // ascending
-            if(ev(1) > 5.f * ev(0) + 1e-6f)                 // direction observable
-            {
-                const Eigen::Vector3f d = esN.eigenvectors().col(0);
-                Eigen::Matrix3f A = d * d.transpose();      // gauge: p.d = 0
-                Eigen::Vector3f b = Eigen::Vector3f::Zero();
-                for(const Ob& ob : obs){
-                    const Eigen::Vector3f cw = -ob.R.transpose() * ob.t; // camera centre, world
-                    A += ob.nw * ob.nw.transpose();
-                    b += ob.nw * ob.nw.dot(cw);
-                }
-                Eigen::SelfAdjointEigenSolver<Eigen::Matrix3f> esA(A);
-                if(esA.eigenvalues()(0) > 1e-4f)            // point observable
-                {
-                    const Eigen::Vector3f p = A.ldlt().solve(b);
-                    dw = d; mw = p.cross(d);
-                    solved = true;
-                }
-            }
-        }
-        if(!solved &&
-           !MapLine::Triangulate(obs[bi].nc, obs[bi].R, obs[bi].t,
-                                 obs[bj].nc, obs[bj].R, obs[bj].t,
-                                 2.0f, dw, mw)) continue;
-
-        // the re-solve must actually explain the observations better
-        const float residNew = maxResid(dw, mw);
-        if(residNew > 0.5f * residOld && residNew > 0.006f) continue;
-
-        // must still explain BOTH source observations at positive depth
-        bool ok = true;
-        for(int k : {bi, bj}){
-            const Eigen::Vector3f d_c = obs[k].R * dw;
-            const Eigen::Vector3f m_c = obs[k].R * mw + obs[k].t.cross(d_c);
-            for(const Eigen::Vector3f& b : {obs[k].b1, obs[k].b2}){
-                const Eigen::Vector3f cr = b.cross(d_c);
-                const float den = cr.squaredNorm();
-                if(den < 1e-10f || m_c.dot(cr)/den <= 0.05f){ ok = false; break; }
-            }
-            if(!ok) break;
-        }
-        if(!ok) continue;
-
-        const float oldPar = pML->mCreateParallax;
-        pML->SetPlucker(dw, mw);              // slides the extent onto the new line
-        pML->mCreateParallax = best;
-        // re-derive the extent from the widest pair's observations
-        pML->mbHasExtent = false;
-        for(int k : {bi, bj})
-            pML->SetExtentFromBearings(obs[k].R, obs[k].t, obs[k].b1, obs[k].b2);
-        nImproved++; gainSum += 180.0/M_PI*(best - oldPar);
+        const float rFinal = RefineLineFromObservations(pML);
+        if(rFinal < 0.006f) nImproved++;
     }
     static long nq = 0;
     if(++nq % 20 == 0 && nTried)
         std::cout << "[AUDIT] RetriangulateLines: " << nImproved << "/" << nTried
-                  << " re-solved on a wider pair, mean parallax gain "
-                  << (nImproved ? gainSum/nImproved : 0.0) << " deg" << std::endl;
+                  << " lines explain all their observations after refinement"
+                  << std::endl;
+}
+
+float LocalMapping::RefineLineFromObservations(MapLine* pML)
+{
+    // gather this landmark's observations, each as a world-frame plane
+    struct Ob { Eigen::Vector3f nw, nc, t; Eigen::Matrix3f R; Eigen::Vector3f b1, b2; };
+    std::vector<Ob> obs;
+    for(auto &o : pML->GetObservations())
+    {
+        KeyFrame* pK = o.first; const int idx = o.second;
+        if(!pK || pK->isBad() || idx < 0 || idx >= (int)pK->mvLines.size()) continue;
+        const LineObs &lo = pK->mvLines[idx];
+        Sophus::SE3f Tc = pK->GetPose();
+        if(lo.cam == 1 && pK->mpCamera2) Tc = pK->GetRelativePoseTrl() * Tc;
+        Ob ob; ob.R = Tc.rotationMatrix(); ob.t = Tc.translation();
+        ob.nc = lo.n; ob.nw = ob.R.transpose() * lo.n;
+        ob.b1 = lo.b1u; ob.b2 = lo.b2u;
+        obs.push_back(ob);
+    }
+    if(obs.size() < 2) return 1e9f;
+
+    // maxResid: worst angular distance [rad] of any observed endpoint bearing
+    // from the line's predicted great circle (degenerate plane = worst).
+    auto maxResid = [&](const Eigen::Vector3f& d, const Eigen::Vector3f& m){
+        float worst = 0.f;
+        for(const Ob& ob : obs){
+            const Eigen::Vector3f d_c = ob.R * d;
+            const Eigen::Vector3f m_c = ob.R * m + ob.t.cross(d_c);
+            if(m_c.norm() < 1e-9f) return 1e9f;   // through a camera centre
+            const Eigen::Vector3f n_c = m_c.normalized();
+            for(const Eigen::Vector3f& b : {ob.b1, ob.b2})
+                worst = std::max(worst,
+                    std::asin(std::min(1.f, std::fabs(n_c.dot(b)))));
+        }
+        return worst;
+    };
+    const float residOld = maxResid(pML->GetDirection(), pML->GetMoment());
+    if(residOld < 0.006f) return residOld;   // ~0.35 deg: already explains all
+
+    // MULTIVIEW solve with the poses held FIXED: direction = common null
+    // direction of all plane normals (smallest eigenvector of sum n n^T);
+    // a point on the line satisfies n_k . (p - c_k) = 0 for every k.
+    // Conditioning is checked on the actual systems (eigenvalue separation
+    // for the direction, invertibility for the depth), NOT on a pairwise
+    // parallax angle -- four planes 1.12 deg apart jointly condition a line
+    // that any single pair fails.
+    Eigen::Vector3f dw, mw;
+    bool solved = false;
+    if(obs.size() >= 3)
+    {
+        Eigen::Matrix3f N = Eigen::Matrix3f::Zero();
+        for(const Ob& ob : obs) N += ob.nw * ob.nw.transpose();
+        Eigen::SelfAdjointEigenSolver<Eigen::Matrix3f> esN(N);
+        const Eigen::Vector3f ev = esN.eigenvalues();   // ascending
+        if(ev(1) > 5.f * ev(0) + 1e-6f)                 // direction observable
+        {
+            const Eigen::Vector3f d = esN.eigenvectors().col(0);
+            Eigen::Matrix3f A = d * d.transpose();      // gauge: p.d = 0
+            Eigen::Vector3f b = Eigen::Vector3f::Zero();
+            for(const Ob& ob : obs){
+                const Eigen::Vector3f cw = -ob.R.transpose() * ob.t;
+                A += ob.nw * ob.nw.transpose();
+                b += ob.nw * ob.nw.dot(cw);
+            }
+            Eigen::SelfAdjointEigenSolver<Eigen::Matrix3f> esA(A);
+            if(esA.eigenvalues()(0) > 1e-4f)            // point observable
+            {
+                const Eigen::Vector3f p = A.ldlt().solve(b);
+                dw = d; mw = p.cross(d);
+                solved = true;
+            }
+        }
+    }
+    // fallback: widest pair of interpretation planes
+    int bi = -1, bj = -1; float best = 0.f;
+    for(size_t i = 0; i < obs.size(); i++)
+        for(size_t j = i + 1; j < obs.size(); j++){
+            const float a = std::asin(std::min(1.f, obs[i].nw.cross(obs[j].nw).norm()));
+            if(a > best){ best = a; bi = (int)i; bj = (int)j; }
+        }
+    if(bi < 0) return residOld;
+    if(!solved &&
+       !MapLine::Triangulate(obs[bi].nc, obs[bi].R, obs[bi].t,
+                             obs[bj].nc, obs[bj].R, obs[bj].t,
+                             2.0f, dw, mw)) return residOld;
+
+    // the re-solve must actually explain the observations better
+    const float residNew = maxResid(dw, mw);
+    if(residNew > 0.5f * residOld && residNew > 0.006f) return residOld;
+
+    // must still explain the widest pair at positive depth
+    for(int k : {bi, bj}){
+        const Eigen::Vector3f d_c = obs[k].R * dw;
+        const Eigen::Vector3f m_c = obs[k].R * mw + obs[k].t.cross(d_c);
+        for(const Eigen::Vector3f& b : {obs[k].b1, obs[k].b2}){
+            const Eigen::Vector3f cr = b.cross(d_c);
+            const float den = cr.squaredNorm();
+            if(den < 1e-10f || m_c.dot(cr)/den <= 0.05f) return residOld;
+        }
+    }
+
+    pML->SetPlucker(dw, mw);              // slides the extent onto the new line
+    pML->mCreateParallax = best;
+    // re-derive the extent from the widest pair's observations
+    pML->mbHasExtent = false;
+    for(int k : {bi, bj})
+        pML->SetExtentFromBearings(obs[k].R, obs[k].t, obs[k].b1, obs[k].b2);
+    return residNew;
+}
+
+void LocalMapping::RevalidateMapLines(Map* pMap, bool bDelete)
+{
+    // Every line, whole map: does the stored geometry still explain the
+    // observations? Called after inertial re-initialisations move all the
+    // keyframes, and once more before the map is saved -- the saved map's
+    // worst offenders were exactly lines whose keyframes stopped being
+    // revisited, so no neighbourhood sweep could ever re-check them.
+    if(!pMap) return;
+    const float kMaxRad = 0.012f;   // ~0.7 deg (~3 px mid-fisheye), culling parity
+    int nOk = 0, nBad = 0, nYoung = 0;
+    for(MapLine* pML : pMap->GetAllMapLines())
+    {
+        if(!pML || pML->isBad()) continue;
+        if(pML->SupportCount() >= 3 && pML->RefitFromPoints()){ nOk++; continue; }
+        const float r = RefineLineFromObservations(pML);
+        if(r > 1e8f){ nYoung++; continue; }   // <2 usable obs: not judgeable
+        if(r <= kMaxRad) nOk++;
+        else {
+            nBad++;
+            if(bDelete) pML->SetBadFlag();
+        }
+    }
+    std::cout << "[AUDIT] RevalidateMapLines: " << nOk << " consistent, "
+              << nBad << (bDelete ? " deleted, " : " inconsistent (kept), ")
+              << nYoung << " young/unjudgeable" << std::endl;
 }
 
 void LocalMapping::RemoveLineOutliers()
@@ -1718,6 +1733,12 @@ void LocalMapping::InitializeIMU(float priorG, float priorA, bool bFIBA)
     mpTracker->mState=Tracking::OK;
     bInitializing = false;
 
+    // The re-expression + full inertial BA above moved every keyframe; lines
+    // (not in that BA) are stale against the new poses. Repair them here,
+    // poses fixed -- deletion is left to the regular culling and the save-time
+    // sweep.
+    RevalidateMapLines(mpAtlas->GetCurrentMap(), false);
+
     mpCurrentKeyFrame->GetMap()->IncreaseChangeIndex();
 
     return;
@@ -1785,6 +1806,9 @@ void LocalMapping::ScaleRefinement()
     mlNewKeyFrames.clear();
 
     double t_inertial_only = std::chrono::duration_cast<std::chrono::duration<double> >(t1 - t0).count();
+
+    // scale/gravity refinement moved the whole map: repair lines against it
+    RevalidateMapLines(mpAtlas->GetCurrentMap(), false);
 
     // To perform pose-inertial opt w.r.t. last keyframe
     mpCurrentKeyFrame->GetMap()->IncreaseChangeIndex();
