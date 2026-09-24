@@ -448,8 +448,48 @@ void LocalMapping::RetriangulateLines()
         const float residOld = maxResid(pML->GetDirection(), pML->GetMoment());
         if(residOld < 0.006f) continue;   // ~0.35 deg: still explains every obs
 
+        // MULTIVIEW refinement with the poses held FIXED. Every observation
+        // contributes its interpretation plane; the line direction is the
+        // common null direction of all the plane normals (smallest eigenvector
+        // of N = sum w n n^T -- n.d = 0 for every plane containing the line),
+        // and a point on the line satisfies n_k . (p - c_k) = 0 for every
+        // observation. A pair of planes 1.12 deg apart fails the 2-view 2 deg
+        // floor, but FOUR such planes jointly condition the same line (line
+        // 18207: multiview solve explains all obs to 0.067 deg). Conditioning
+        // is checked on the actual systems, not on a pairwise angle:
+        //   - direction: smallest eigenvalue of N well separated from the mid
+        //     one (his "direction stability")
+        //   - point: A = sum n n^T + d d^T must be invertible-well (the thin
+        //     sheaf case leaves depth unconstrained and MUST be rejected)
         Eigen::Vector3f dw, mw;
-        if(!MapLine::Triangulate(obs[bi].nc, obs[bi].R, obs[bi].t,
+        bool solved = false;
+        if(obs.size() >= 3)
+        {
+            Eigen::Matrix3f N = Eigen::Matrix3f::Zero();
+            for(const Ob& ob : obs) N += ob.nw * ob.nw.transpose();
+            Eigen::SelfAdjointEigenSolver<Eigen::Matrix3f> esN(N);
+            const Eigen::Vector3f ev = esN.eigenvalues();   // ascending
+            if(ev(1) > 5.f * ev(0) + 1e-6f)                 // direction observable
+            {
+                const Eigen::Vector3f d = esN.eigenvectors().col(0);
+                Eigen::Matrix3f A = d * d.transpose();      // gauge: p.d = 0
+                Eigen::Vector3f b = Eigen::Vector3f::Zero();
+                for(const Ob& ob : obs){
+                    const Eigen::Vector3f cw = -ob.R.transpose() * ob.t; // camera centre, world
+                    A += ob.nw * ob.nw.transpose();
+                    b += ob.nw * ob.nw.dot(cw);
+                }
+                Eigen::SelfAdjointEigenSolver<Eigen::Matrix3f> esA(A);
+                if(esA.eigenvalues()(0) > 1e-4f)            // point observable
+                {
+                    const Eigen::Vector3f p = A.ldlt().solve(b);
+                    dw = d; mw = p.cross(d);
+                    solved = true;
+                }
+            }
+        }
+        if(!solved &&
+           !MapLine::Triangulate(obs[bi].nc, obs[bi].R, obs[bi].t,
                                  obs[bj].nc, obs[bj].R, obs[bj].t,
                                  2.0f, dw, mw)) continue;
 
@@ -527,18 +567,22 @@ void LocalMapping::RemoveLineOutliers()
             if(lo.cam == 1 && pK->mpCamera2) Tc = pK->GetRelativePoseTrl() * Tc;
             const Eigen::Matrix3f R = Tc.rotationMatrix();
             const Eigen::Vector3f t = Tc.translation();
-            const float f = pK->mpCamera ? pK->mpCamera->getParameter(0) : 400.f;
+            // OBSERVED bearings vs the PREDICTED plane -- the previous check
+            // was backwards: it projected the STORED endpoints onto the
+            // OBSERVED plane, so a line pointing at the camera projects to a
+            // stub whose endpoints hug the observed circle and pass (line
+            // 18207: 112 px detected edge, 3.4 px stub, reported 1.5 px
+            // "error" while the observed bearings miss its plane by 12 deg).
+            // AngularError returns pi on a degenerate plane (line through the
+            // camera centre), so that case is rejected, never rewarded.
+            const float e = std::max(pML->AngularError(R, t, lo.b1u),
+                                     pML->AngularError(R, t, lo.b2u))
+                            * lo.pxPerRad;
+            worst = std::max(worst, e);
             for(const Eigen::Vector3f& X : {S, E})
             {
                 const Eigen::Vector3f Xc = R * X + t;
-                if(Xc(2) <= 0.05f){ behind = true; break; }
-                const float r = Xc.norm();
-                if(r < 1e-6f){ behind = true; break; }
-                // angular distance of this endpoint from the OBSERVED great
-                // circle, in pixels -- the same residual the edges minimise
-                const float e = std::asin(std::min(1.f,
-                                   std::fabs(lo.n.dot(Xc / r)))) * f;
-                worst = std::max(worst, e);
+                if(Xc(2) <= 0.05f || Xc.norm() < 1e-6f){ behind = true; break; }
             }
             if(behind) break;
             nUsed++;
