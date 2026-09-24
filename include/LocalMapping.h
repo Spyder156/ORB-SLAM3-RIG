@@ -54,8 +54,14 @@ public:
     static void RevalidateMapLines(Map* pMap, bool bDelete);
     /// The per-line core: residual over all observations, multiview repair
     /// with fixed poses (conditioning-checked), fallback widest-pair solve.
-    /// Returns the line's final worst residual [rad] (1e9 if no usable obs).
+    /// Returns the final worst residual [rad]; NEGATIVE means "insufficient
+    /// observations to judge" -- distinct from a large residual, which means
+    /// judged-and-invalid (1e9 = plane through a camera centre).
     static float RefineLineFromObservations(MapLine* pML);
+    /// Residual only, NO repair: worst angular distance [rad] of any observed
+    /// endpoint bearing from the line's current predicted plane, across all
+    /// keyframe observations. Negative if fewer than 2 usable observations.
+    static float LineWorstObsResidual(MapLine* pML);
 
     /// Lines.outlierCull / Lines.culling in the settings file (default on).
     /// Off isolates the residual change from the culling passes for A/B tests.

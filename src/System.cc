@@ -867,7 +867,12 @@ void System::SaveMapLines(const string &filename)
 
     ofstream f(filename);
     f << fixed << "t,x1,y1,z1,x2,y2,z2,validated,id,support" << endl;
-    long n = 0, noext = 0;
+    // UNVERIFIED candidates (insufficient observations for the multiview
+    // check) are exported SEPARATELY: the map file holds only geometry that
+    // passed reprojection against all its observations.
+    ofstream fu(filename.substr(0, filename.find_last_of('.')) + "_unverified.csv");
+    fu << fixed << "t,x1,y1,z1,x2,y2,z2,validated,id,support" << endl;
+    long n = 0, noext = 0, nUnv = 0;
     for(MapLine* pML : pBiggerMap->GetAllMapLines())
     {
         if(!pML || pML->isBad()) continue;
@@ -890,14 +895,18 @@ void System::SaveMapLines(const string &filename)
         e1 = Tb0w * e1;  e2 = Tb0w * e2;
         double t = 0.0;
         if(KeyFrame* pRef = pML->GetReferenceKeyFrame()) t = pRef->mTimeStamp;
-        f << setprecision(9) << t << "," << setprecision(6)
+        ofstream &dst = (pML->mnGeomVerdict == 1) ? f : fu;   // verified vs candidate
+        dst << setprecision(9) << t << "," << setprecision(6)
           << e1(0) << "," << e1(1) << "," << e1(2) << ","
           << e2(0) << "," << e2(1) << "," << e2(2) << ","
           << pML->mnValidated << "," << pML->mnId << ","
           << pML->SupportCount() << endl;
-        n++;
+        if(pML->mnGeomVerdict == 1) n++; else nUnv++;
     }
     f.close();
+    fu.close();
+    cout << "  " << n << " verified lines saved; " << nUnv
+         << " unverified candidates -> _unverified.csv" << endl;
 
     {   // GROUND TRUTH FOR OFFLINE ANALYSIS, all at FINAL state and all in the
         // SAME b0 frame as the map above. Two files:

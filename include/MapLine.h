@@ -165,6 +165,11 @@ public:
     /// supported for plane re-triangulation, too few points for the fit) and
     /// let failed fits block geometric repair.
     bool mbSupportFitOk = false;
+    /// RevalidateMapLines verdict: 0 = unjudged (insufficient observations --
+    /// a CANDIDATE, kept separate at export), 1 = passed the multiview
+    /// reprojection check, -1 = inconsistent (deleted at save time). Point-
+    /// supported lines get NO exemption: a point fit must still reproject.
+    int mnGeomVerdict = 0;
 
     /// First observation (plane normal + lens pose), kept so the line can be
     /// RE-TRIANGULATED against later, wider-baseline observations -- the

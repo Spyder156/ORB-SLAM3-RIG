@@ -424,7 +424,7 @@ float LocalMapping::RefineLineFromObservations(MapLine* pML)
         ob.b1 = lo.b1u; ob.b2 = lo.b2u;
         obs.push_back(ob);
     }
-    if(obs.size() < 2) return 1e9f;
+    if(obs.size() < 2) return -1.f;   // insufficient obs: candidate, not a verdict
 
     // maxResid: worst angular distance [rad] of any observed endpoint bearing
     // from the line's predicted great circle (degenerate plane = worst).
@@ -515,6 +515,31 @@ float LocalMapping::RefineLineFromObservations(MapLine* pML)
     return residNew;
 }
 
+float LocalMapping::LineWorstObsResidual(MapLine* pML)
+{
+    // residual of the CURRENT geometry against every observation; no repair
+    const Eigen::Vector3f d = pML->GetDirection(), m = pML->GetMoment();
+    float worst = 0.f; int n = 0;
+    for(auto &o : pML->GetObservations())
+    {
+        KeyFrame* pK = o.first; const int idx = o.second;
+        if(!pK || pK->isBad() || idx < 0 || idx >= (int)pK->mvLines.size()) continue;
+        const LineObs &lo = pK->mvLines[idx];
+        Sophus::SE3f Tc = pK->GetPose();
+        if(lo.cam == 1 && pK->mpCamera2) Tc = pK->GetRelativePoseTrl() * Tc;
+        const Eigen::Matrix3f R = Tc.rotationMatrix();
+        const Eigen::Vector3f t = Tc.translation();
+        const Eigen::Vector3f d_c = R * d;
+        const Eigen::Vector3f m_c = R * m + t.cross(d_c);
+        if(m_c.norm() < 1e-9f) return 1e9f;   // through a camera centre: invalid
+        const Eigen::Vector3f n_c = m_c.normalized();
+        for(const Eigen::Vector3f& b : {lo.b1u, lo.b2u})
+            worst = std::max(worst, std::asin(std::min(1.f, std::fabs(n_c.dot(b)))));
+        n++;
+    }
+    return (n >= 2) ? worst : -1.f;
+}
+
 void LocalMapping::RevalidateMapLines(Map* pMap, bool bDelete)
 {
     // Every line, whole map: does the stored geometry still explain the
@@ -524,22 +549,30 @@ void LocalMapping::RevalidateMapLines(Map* pMap, bool bDelete)
     // revisited, so no neighbourhood sweep could ever re-check them.
     if(!pMap) return;
     const float kMaxRad = 0.012f;   // ~0.7 deg (~3 px mid-fisheye), culling parity
-    int nOk = 0, nBad = 0, nYoung = 0;
+    int nOk = 0, nBad = 0, nCand = 0;
     for(MapLine* pML : pMap->GetAllMapLines())
     {
         if(!pML || pML->isBad()) continue;
-        if(pML->SupportCount() >= 3 && pML->RefitFromPoints()){ nOk++; continue; }
-        const float r = RefineLineFromObservations(pML);
-        if(r > 1e8f){ nYoung++; continue; }   // <2 usable obs: not judgeable
-        if(r <= kMaxRad) nOk++;
+        // NO exemptions: a point-supported line refits from its points, then
+        // must STILL pass the same multiview reprojection check as everyone
+        // else. (The earlier version let a successful point fit skip
+        // validation entirely -- a fit to the wrong points sailed through.)
+        float r;
+        if(pML->SupportCount() >= 3 && pML->RefitFromPoints())
+            r = LineWorstObsResidual(pML);
+        else
+            r = RefineLineFromObservations(pML);
+        if(r < 0.f){ pML->mnGeomVerdict = 0; nCand++; continue; }  // candidate
+        if(r <= kMaxRad){ pML->mnGeomVerdict = 1; nOk++; }
         else {
+            pML->mnGeomVerdict = -1;
             nBad++;
             if(bDelete) pML->SetBadFlag();
         }
     }
-    std::cout << "[AUDIT] RevalidateMapLines: " << nOk << " consistent, "
+    std::cout << "[AUDIT] RevalidateMapLines: " << nOk << " verified, "
               << nBad << (bDelete ? " deleted, " : " inconsistent (kept), ")
-              << nYoung << " young/unjudgeable" << std::endl;
+              << nCand << " candidates (insufficient obs, kept separate)" << std::endl;
 }
 
 void LocalMapping::RemoveLineOutliers()
