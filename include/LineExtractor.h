@@ -53,6 +53,35 @@ struct LineObs {
     Eigen::Vector3f nAnchor = Eigen::Vector3f::Zero();
     Eigen::Matrix3f RAnchor = Eigen::Matrix3f::Identity();
     Eigen::Vector3f tAnchor = Eigen::Vector3f::Zero();
+
+    /// APPEARANCE. Band intensity profile across the edge: mean image
+    /// intensity at {-5,-2,+2,+5} px along the local pixel normal, sampled
+    /// along the segment, zero-mean/unit-norm normalised. Left/right is
+    /// well-defined because the endpoint order is CANONICALISED (see
+    /// CanonicalizeObs): two parallel edges of one bright strip -- geometric
+    /// twins -- have opposite profiles. Geometry shortlists, THIS decides.
+    float desc[4] = {0, 0, 0, 0};
+    float contrast = 0.f;        ///< mean |across-edge gradient|, 0..255 scale
+    int polarity = 0;            ///< sign of the across-edge gradient (+1/-1)
+    bool hasDesc = false;
+};
+
+/// A persistent 2D line track: identity across frames, surviving brief
+/// misses and failed triangulation. The 3D landmark (pML inside `last`)
+/// attaches when geometry permits; the IDENTITY lives here.
+struct LineTrack {
+    long id = -1;
+    LineObs last;                ///< most recent accepted observation
+    /// last.n / last bearings rotated by the ACCUMULATED gyro rotation since
+    /// the track was last seen -- where the edge SHOULD be now
+    Eigen::Vector3f nPred = Eigen::Vector3f::Zero();
+    Eigen::Vector3f b1Pred = Eigen::Vector3f::Zero();
+    Eigen::Vector3f b2Pred = Eigen::Vector3f::Zero();
+    int age = 0;                 ///< frames since birth
+    int missed = 0;              ///< consecutive frames without a match
+    int polSum = 0;              ///< running polarity vote (history)
+    float descEma[4] = {0,0,0,0};///< EMA of the band profile (history)
+    bool emaInit = false;
 };
 
 class LineExtractor {
@@ -83,6 +112,18 @@ public:
     std::vector<int> Match(const std::vector<LineObs>& cur,
                            const std::vector<LineObs>& prev) const;
 
+    /// Canonical endpoint order: n = b1 x b2 with n_z > 0 (n_x tie-break).
+    /// Detector endpoint order is arbitrary; the band descriptor's left/right
+    /// only means anything once the traversal direction is fixed.
+    static void CanonicalizeObs(LineObs& o);
+    /// Band profile + polarity from the image, sampled along the (possibly
+    /// curved) pixel polyline of the observation. Fills desc/contrast/polarity.
+    static void ComputeBandDescriptor(const cv::Mat& img,
+                                      const std::vector<cv::Point2f>& poly,
+                                      LineObs& o);
+    /// L2 distance between normalised band profiles (2.0 = worst).
+    static float DescDist(const float a[4], const float b[4]);
+
     float mMinAngLen, mMaxAngLen;   ///< [rad]
     float mGateNormal, mGateDir;    ///< [rad]
     float mGateLenRatio;
@@ -101,6 +142,57 @@ public:
     float mMergeMaxGap = 1.0f;
     mutable GeometricCamera* mpCamForMerge = nullptr;
     int mGradThresh, mMinLenPx;
+};
+
+/**
+ * Persistent line tracker, one per lens:
+ *   gyro-predict -> loose geometric shortlist -> appearance decides
+ *   -> ambiguity checks -> per-fragment assignment.
+ *
+ * Identity lives HERE (track ids survive brief misses and failed
+ * triangulation); the 3D landmark rides inside the track's LineObs and
+ * attaches when geometry permits. Fragments are friends: several current
+ * fragments may bind to ONE track (that is what a broken edge is); ratio
+ * ambiguity is only measured between COMPETING track identities.
+ *
+ * Two-phase per frame:
+ *   Match(cur, dR)  predicts every live track by the gyro rotation, matches,
+ *                   copies track identity (pML/anchor/nSeen) INTO the matched
+ *                   cur observations, returns track index per cur (-1 = new).
+ *   Commit(cur,asg) stores the frame's FINAL observations back into the
+ *                   tracks (Tracking mutates them in between: triangulation,
+ *                   landmark binding), spawns tracks for the unmatched.
+ */
+class LineTracker {
+public:
+    /// dR_cur_prev: rotation taking PREV-frame camera coords to CUR-frame
+    /// camera coords (bias-corrected gyro; identity if unavailable).
+    std::vector<int> Match(std::vector<LineObs>& cur,
+                           const Eigen::Matrix3f& dR_cur_prev);
+    void Commit(const std::vector<LineObs>& cur, const std::vector<int>& asg);
+    void Reset() { mTracks.clear(); }
+    const std::vector<LineTrack>& Tracks() const { return mTracks; }
+
+    // gates: LOOSE -- they only shortlist, appearance decides
+    float mGateNormalRad = 3.0f * 3.14159265f / 180.f;
+    float mGateOrthPx = 12.f;
+    float mGateOverlap = 0.3f;
+    // decision thresholds
+    float mDescAbsMax = 0.55f;   ///< absolute descriptor quality (not just ratio)
+    float mDescRatioMax = 0.8f;  ///< distinctiveness vs best COMPETING track
+    float mMinContrast = 8.f;    ///< below this the polarity/desc is noise
+    int mMaxMissed = 5;          ///< track survives this many blind frames
+
+    /// Per-frame rejection counters -- which rule killed each candidate.
+    struct Stats {
+        long nCand = 0, killNormal = 0, killOrth = 0, killOverlap = 0,
+             killPolarity = 0, killAbs = 0, killRatio = 0, killHistory = 0,
+             matched = 0, fresh = 0, dropped = 0;
+    } mStats;
+
+private:
+    std::vector<LineTrack> mTracks;
+    long mNextId = 0;
 };
 
 }  // namespace ORB_SLAM3

@@ -86,7 +86,99 @@ std::vector<LineObs> LineExtractor::Extract(const cv::Mat& imGray,
         out.push_back(lo);
     }
     if (mbMergeCircles) out = MergeGreatCircles(out);
+    // canonical endpoint order + appearance, AFTER merge so merged arcs get
+    // their own descriptor. The polyline is sampled from the (possibly
+    // curved) projected arc when a camera is available, else the pixel chord.
+    for (LineObs& o : out) {
+        CanonicalizeObs(o);
+        std::vector<cv::Point2f> poly;
+        const int K = 16;
+        if (pCam) {
+            const float th = std::acos(std::max(-1.f, std::min(1.f, o.b1u.dot(o.b2u))));
+            for (int k = 0; k < K; k++) {
+                const float t = float(k) / (K - 1);
+                Eigen::Vector3f bk = th > 1e-6f
+                    ? ((std::sin((1 - t) * th) * o.b1u + std::sin(t * th) * o.b2u) / std::sin(th)).normalized()
+                    : o.b1u;
+                poly.push_back(pCam->project(cv::Point3f(bk.x(), bk.y(), bk.z())));
+            }
+        } else {
+            for (int k = 0; k < K; k++) {
+                const float t = float(k) / (K - 1);
+                poly.push_back(o.p1 * (1 - t) + o.p2 * t);
+            }
+        }
+        ComputeBandDescriptor(imGray, poly, o);
+    }
     return out;
+}
+
+void LineExtractor::CanonicalizeObs(LineObs& o) {
+    // n = b1 x b2 with n_z > 0 (n_x tie-break): detector endpoint order is
+    // arbitrary, and the band descriptor's left/right side only means
+    // anything once the traversal direction is fixed. Swapping endpoints
+    // flips n, so fixing n's hemisphere fixes the order.
+    const bool flip = (std::fabs(o.n.z()) > 1e-3f) ? (o.n.z() < 0.f)
+                                                   : (o.n.x() < 0.f);
+    if (flip) {
+        std::swap(o.p1, o.p2);
+        std::swap(o.b1u, o.b2u);
+        o.n = -o.n;
+        o.dir = -o.dir;
+    }
+}
+
+void LineExtractor::ComputeBandDescriptor(const cv::Mat& img,
+                                          const std::vector<cv::Point2f>& poly,
+                                          LineObs& o) {
+    // Mean intensity at {-5,-2,+2,+5} px along the LOCAL pixel normal,
+    // averaged along the polyline; zero-mean unit-norm. polarity = which side
+    // is brighter -- the one bit that separates the two edges of a strip.
+    static const float offs[4] = {-5.f, -2.f, 2.f, 5.f};
+    double acc[4] = {0, 0, 0, 0};
+    int cnt = 0;
+    auto sample = [&](float x, float y) -> float {
+        const int xi = (int)x, yi = (int)y;
+        if (xi < 0 || yi < 0 || xi + 1 >= img.cols || yi + 1 >= img.rows)
+            return -1.f;
+        const float fx = x - xi, fy = y - yi;
+        const uchar* r0 = img.ptr<uchar>(yi), *r1 = img.ptr<uchar>(yi + 1);
+        return (1-fx)*(1-fy)*r0[xi] + fx*(1-fy)*r0[xi+1]
+             + (1-fx)*fy*r1[xi] + fx*fy*r1[xi+1];
+    };
+    for (size_t k = 0; k + 1 < poly.size(); k++) {
+        cv::Point2f t = poly[k + 1] - poly[std::max<size_t>(k, 1) - 1];
+        const float tn = std::hypot(t.x, t.y);
+        if (tn < 1e-6f) continue;
+        const cv::Point2f nrm(-t.y / tn, t.x / tn);   // left of travel
+        float v[4]; bool ok = true;
+        for (int j = 0; j < 4; j++) {
+            v[j] = sample(poly[k].x + nrm.x * offs[j], poly[k].y + nrm.y * offs[j]);
+            if (v[j] < 0.f) { ok = false; break; }
+        }
+        if (!ok) continue;
+        for (int j = 0; j < 4; j++) acc[j] += v[j];
+        cnt++;
+    }
+    if (cnt < 4) { o.hasDesc = false; return; }
+    float m = 0;
+    for (int j = 0; j < 4; j++) { acc[j] /= cnt; m += (float)acc[j]; }
+    m /= 4.f;
+    float nn = 0;
+    for (int j = 0; j < 4; j++) { o.desc[j] = (float)acc[j] - m; nn += o.desc[j] * o.desc[j]; }
+    nn = std::sqrt(nn);
+    const float g = float((acc[2] + acc[3]) - (acc[0] + acc[1])) * 0.5f;
+    o.contrast = std::fabs(g);
+    o.polarity = g >= 0.f ? 1 : -1;
+    if (nn < 1e-3f) { o.hasDesc = false; return; }    // flat: no appearance
+    for (int j = 0; j < 4; j++) o.desc[j] /= nn;
+    o.hasDesc = true;
+}
+
+float LineExtractor::DescDist(const float a[4], const float b[4]) {
+    float s = 0;
+    for (int j = 0; j < 4; j++) s += (a[j] - b[j]) * (a[j] - b[j]);
+    return std::sqrt(s);
 }
 
 std::vector<LineObs> LineExtractor::MergeGreatCircles(
@@ -263,6 +355,166 @@ std::vector<int> LineExtractor::Match(const std::vector<LineObs>& cur,
         usedPrev[c.j] = true;
     }
     return assign;
+}
+
+// ---------------------------------------------------------------------------
+//                                LineTracker
+// ---------------------------------------------------------------------------
+
+/// angular overlap of two arcs on (approximately) one great circle, as a
+/// fraction of the SHORTER arc; <=0 when disjoint
+static float ArcOverlap(const Eigen::Vector3f& n,
+                        const Eigen::Vector3f& a1, const Eigen::Vector3f& a2,
+                        const Eigen::Vector3f& c1, const Eigen::Vector3f& c2) {
+    Eigen::Vector3f u = a1 - n * n.dot(a1);
+    if (u.norm() < 1e-6f) return -1.f;
+    u.normalize();
+    const Eigen::Vector3f v = n.cross(u);
+    auto ang = [&](const Eigen::Vector3f& b) { return std::atan2(b.dot(v), b.dot(u)); };
+    float x1 = ang(a1), x2 = ang(a2), y1 = ang(c1), y2 = ang(c2);
+    if (x1 > x2) std::swap(x1, x2);
+    if (y1 > y2) std::swap(y1, y2);
+    const float PI2 = 2.f * float(M_PI);
+    if (x2 - x1 > float(M_PI)) { const float t = x1; x1 = x2; x2 = t + PI2; }
+    if (y2 - y1 > float(M_PI)) { const float t = y1; y1 = y2; y2 = t + PI2; }
+    const float l1 = x2 - x1, l2 = y2 - y1;
+    if (l1 < 1e-6f || l2 < 1e-6f) return -1.f;
+    const float ov = std::min(x2, y2) - std::max(x1, y1);
+    return ov / std::min(l1, l2);
+}
+
+std::vector<int> LineTracker::Match(std::vector<LineObs>& cur,
+                                    const Eigen::Matrix3f& dR_cur_prev) {
+    mStats = Stats();
+
+    // 1. PREDICT every live track one frame forward by the gyro rotation
+    //    (accumulates over missed frames), and prune the long-dead.
+    std::vector<LineTrack> keep;
+    keep.reserve(mTracks.size());
+    for (LineTrack& t : mTracks) {
+        if (t.missed > mMaxMissed) { mStats.dropped++; continue; }
+        t.nPred  = (dR_cur_prev * t.nPred).normalized();
+        t.b1Pred = (dR_cur_prev * t.b1Pred).normalized();
+        t.b2Pred = (dR_cur_prev * t.b2Pred).normalized();
+        keep.push_back(t);
+    }
+    mTracks.swap(keep);
+
+    std::vector<int> asg(cur.size(), -1);
+    if (mTracks.empty() || cur.empty()) return asg;
+
+    const float cN = std::cos(mGateNormalRad);
+    for (size_t i = 0; i < cur.size(); i++) {
+        LineObs& o = cur[i];
+        // 2. LOOSE geometric shortlist against the PREDICTED tracks, and the
+        //    appearance distance for each survivor. Geometry may only say
+        //    "maybe" here; the decision below is appearance.
+        float best = 1e9f, second = 1e9f;   // second = best COMPETING track
+        int bi = -1;
+        for (size_t j = 0; j < mTracks.size(); j++) {
+            const LineTrack& t = mTracks[j];
+            if (t.last.cam != o.cam) continue;
+            mStats.nCand++;
+            if (std::fabs(o.n.dot(t.nPred)) < cN) { mStats.killNormal++; continue; }
+            const float s1 = std::asin(std::min(1.f, std::fabs(t.nPred.dot(o.b1u))));
+            const float s2 = std::asin(std::min(1.f, std::fabs(t.nPred.dot(o.b2u))));
+            if (0.5f * (s1 + s2) * o.pxPerRad > mGateOrthPx) { mStats.killOrth++; continue; }
+            if (ArcOverlap(o.n, o.b1u, o.b2u, t.b1Pred, t.b2Pred) < mGateOverlap) {
+                mStats.killOverlap++; continue;
+            }
+            // 3. APPEARANCE. Polarity first: two edges of one strip are
+            //    geometric twins with opposite polarity -- when both sides are
+            //    confidently contrasted and disagree, this is a different edge.
+            if (o.hasDesc && t.emaInit &&
+                o.contrast > mMinContrast && std::abs(t.polSum) >= 2 &&
+                o.polarity * (t.polSum > 0 ? 1 : -1) < 0) {
+                mStats.killPolarity++; continue;
+            }
+            const float d = (o.hasDesc && t.emaInit)
+                          ? LineExtractor::DescDist(o.desc, t.descEma)
+                          : 0.9f;   // no appearance: weak, near the abs limit
+            if (d < best) { second = best; best = d; bi = int(j); }
+            else if (d < second) second = d;
+        }
+        if (bi < 0) continue;
+        // 4. AMBIGUITY. Absolute quality (a ratio can flatter two equally bad
+        //    candidates) AND distinctiveness against the best competing track.
+        if (best > mDescAbsMax) { mStats.killAbs++; continue; }
+        if (second < 1e8f && best / std::max(second, 1e-6f) > mDescRatioMax) {
+            // 5. HISTORY may RESOLVE the ambiguity -- never force a match: it
+            //    only breaks the tie toward a track whose accumulated polarity
+            //    agrees with the current observation.
+            const LineTrack& t = mTracks[bi];
+            const bool polAgree = !(o.hasDesc && t.emaInit) ||
+                (o.polarity * (t.polSum >= 0 ? 1 : -1) >= 0);
+            if (!(polAgree && std::abs(t.polSum) >= 3 && best < 0.7f * mDescAbsMax)) {
+                mStats.killRatio++; continue;
+            }
+            mStats.killHistory--;   // (negative = resolved-by-history count)
+        }
+        // 6. ASSIGN. Per-fragment: several fragments of one broken edge may
+        //    all bind to the same track -- that is fragmentation, not a clash.
+        asg[i] = bi;
+        mStats.matched++;
+        // inherit the track's identity into this observation
+        const LineObs& pl = mTracks[bi].last;
+        o.mnLineId = mTracks[bi].id;
+        if (pl.pML) o.pML = pl.pML;
+        if (pl.hasAnchor) {
+            o.hasAnchor = true;
+            o.nAnchor = pl.nAnchor; o.RAnchor = pl.RAnchor;
+            o.tAnchor = pl.tAnchor; o.anchorMapVersion = pl.anchorMapVersion;
+        }
+        o.nSeen = pl.nSeen + 1;
+    }
+    return asg;
+}
+
+void LineTracker::Commit(const std::vector<LineObs>& cur,
+                         const std::vector<int>& asg) {
+    // store the frame's FINAL observations (Tracking mutated them since
+    // Match: anchors, landmarks, triangulation) back into their tracks;
+    // the longest fragment represents a multiply-fragmented track
+    std::vector<float> bestLen(mTracks.size(), -1.f);
+    std::vector<int> bestIdx(mTracks.size(), -1);
+    for (size_t i = 0; i < cur.size(); i++) {
+        const int j = asg.size() > i ? asg[i] : -1;
+        if (j < 0 || j >= (int)mTracks.size()) continue;
+        if (cur[i].angLen > bestLen[j]) { bestLen[j] = cur[i].angLen; bestIdx[j] = int(i); }
+    }
+    for (size_t j = 0; j < mTracks.size(); j++) {
+        LineTrack& t = mTracks[j];
+        t.age++;
+        if (bestIdx[j] < 0) { t.missed++; continue; }
+        const LineObs& o = cur[bestIdx[j]];
+        const long id = t.id;
+        t.last = o;
+        t.last.mnLineId = id;
+        t.missed = 0;
+        t.nPred = o.n; t.b1Pred = o.b1u; t.b2Pred = o.b2u;
+        if (o.hasDesc) {
+            t.polSum += o.polarity;
+            if (!t.emaInit) { for (int k = 0; k < 4; k++) t.descEma[k] = o.desc[k]; t.emaInit = true; }
+            else for (int k = 0; k < 4; k++) t.descEma[k] = 0.85f * t.descEma[k] + 0.15f * o.desc[k];
+        }
+    }
+    // unmatched observations found a NEW edge: give them an identity
+    for (size_t i = 0; i < cur.size(); i++) {
+        if (i < asg.size() && asg[i] >= 0) continue;
+        LineTrack t;
+        t.id = mNextId++;
+        t.last = cur[i];
+        t.last.mnLineId = t.id;
+        t.nPred = cur[i].n; t.b1Pred = cur[i].b1u; t.b2Pred = cur[i].b2u;
+        t.age = 1; t.missed = 0;
+        if (cur[i].hasDesc) {
+            t.polSum = cur[i].polarity;
+            for (int k = 0; k < 4; k++) t.descEma[k] = cur[i].desc[k];
+            t.emaInit = true;
+        }
+        mTracks.push_back(t);
+        mStats.fresh++;
+    }
 }
 
 }  // namespace ORB_SLAM3
