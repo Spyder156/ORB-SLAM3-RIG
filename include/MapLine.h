@@ -90,10 +90,13 @@ public:
     void ApplyScaledRotation(const Eigen::Matrix3f& R, float s,
                              const Eigen::Vector3f& t);
 
+    /// A keyframe may hold SEVERAL fragments of this line (ELSED breaks an
+    /// edge differently every frame; a broken edge is still one edge). The
+    /// old map<KF*,int> silently overwrote all but the last fragment.
     void AddObservation(KeyFrame* pKF, int idx);
     void EraseObservation(KeyFrame* pKF);
-    std::map<KeyFrame*, int> GetObservations();
-    int Observations();
+    std::map<KeyFrame*, std::vector<int>> GetObservations();
+    int Observations();   ///< number of observing KEYFRAMES (not fragments)
 
     void SetBadFlag();
     bool isBad();
@@ -209,7 +212,7 @@ public:
 protected:
     Eigen::Vector3f mDir;      ///< unit direction
     Eigen::Vector3f mMom;      ///< moment, orthogonal to mDir
-    std::map<KeyFrame*, int> mObservations;
+    std::map<KeyFrame*, std::vector<int>> mObservations;
     std::vector<MapPoint*> mvpSupport;   ///< guarded by mMutexFeatures
     KeyFrame* mpRefKF;
     Map* mpMap;

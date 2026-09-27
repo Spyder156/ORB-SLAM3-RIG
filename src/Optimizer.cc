@@ -2902,19 +2902,23 @@ void Optimizer::LocalInertialBA(KeyFrame *pKF, bool *pbStopFlag, Map *pMap, int&
     for(list<MapLine*>::iterator lit=lLocalMapLines.begin(), lend=lLocalMapLines.end(); lit!=lend; lit++)
     {
         MapLine* pML = *lit;
-        const map<KeyFrame*,int> obs = pML->GetObservations();
+        const map<KeyFrame*,vector<int>> obs = pML->GetObservations();
 
         // Only keyframes already in the graph constrain the line (we do not
         // enlarge the fixed set for lines); a 4-DoF vertex needs >= 2 edges
         // (4 rows) to be determined, else it is left out untouched.
+        // One entry per FRAGMENT: several fragments of one edge in one
+        // keyframe each contribute their own residual rows.
         vector<pair<KeyFrame*,int>> vUsable;
-        for(map<KeyFrame*,int>::const_iterator mit=obs.begin(), mend=obs.end(); mit!=mend; mit++)
+        for(auto mit=obs.begin(), mend=obs.end(); mit!=mend; mit++)
         {
             KeyFrame* pKFi = mit->first;
             if(pKFi->mnBALocalForKF!=pKF->mnId && pKFi->mnBAFixedForKF!=pKF->mnId) continue;
             if(pKFi->isBad() || pKFi->GetMap() != pCurrentMap) continue;
-            if(mit->second < 0 || mit->second >= (int)pKFi->mvLines.size()) continue;
-            vUsable.push_back(make_pair(pKFi, mit->second));
+            for(int idx : mit->second){
+                if(idx < 0 || idx >= (int)pKFi->mvLines.size()) continue;
+                vUsable.push_back(make_pair(pKFi, idx));
+            }
         }
         if(vUsable.size() < 2) continue;
 

@@ -521,6 +521,12 @@ public:
     // (lens index in LineObs::cam); mvpMapLines runs parallel to mvLines.
     std::vector<LineObs> mvLines;
     std::vector<MapLine*> mvpMapLines;
+    /// Replace the line bindings with the frame's FINAL ones. The constructor
+    /// snapshot is taken mid-Track(), BEFORE triangulation/validation/
+    /// re-acquisition finish; Tracking calls this right before the keyframe
+    /// is published to LocalMapping.
+    void SetLineObservations(const std::vector<LineObs>& v,
+                             const std::vector<MapLine*>& m);
     // Null every slot bound to pML (the line-side EraseMapPointMatch).
     void EraseMapLineMatch(MapLine* pML);
 

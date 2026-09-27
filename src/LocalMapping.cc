@@ -414,15 +414,19 @@ float LocalMapping::RefineLineFromObservations(MapLine* pML)
     std::vector<Ob> obs;
     for(auto &o : pML->GetObservations())
     {
-        KeyFrame* pK = o.first; const int idx = o.second;
-        if(!pK || pK->isBad() || idx < 0 || idx >= (int)pK->mvLines.size()) continue;
-        const LineObs &lo = pK->mvLines[idx];
-        Sophus::SE3f Tc = pK->GetPose();
-        if(lo.cam == 1 && pK->mpCamera2) Tc = pK->GetRelativePoseTrl() * Tc;
-        Ob ob; ob.R = Tc.rotationMatrix(); ob.t = Tc.translation();
-        ob.nc = lo.n; ob.nw = ob.R.transpose() * lo.n;
-        ob.b1 = lo.b1u; ob.b2 = lo.b2u;
-        obs.push_back(ob);
+        KeyFrame* pK = o.first;
+        if(!pK || pK->isBad()) continue;
+        for(int idx : o.second)   // every FRAGMENT is its own plane
+        {
+            if(idx < 0 || idx >= (int)pK->mvLines.size()) continue;
+            const LineObs &lo = pK->mvLines[idx];
+            Sophus::SE3f Tc = pK->GetPose();
+            if(lo.cam == 1 && pK->mpCamera2) Tc = pK->GetRelativePoseTrl() * Tc;
+            Ob ob; ob.R = Tc.rotationMatrix(); ob.t = Tc.translation();
+            ob.nc = lo.n; ob.nw = ob.R.transpose() * lo.n;
+            ob.b1 = lo.b1u; ob.b2 = lo.b2u;
+            obs.push_back(ob);
+        }
     }
     if(obs.size() < 2) return -1.f;   // insufficient obs: candidate, not a verdict
 
@@ -522,8 +526,11 @@ float LocalMapping::LineWorstObsResidual(MapLine* pML)
     float worst = 0.f; int n = 0;
     for(auto &o : pML->GetObservations())
     {
-        KeyFrame* pK = o.first; const int idx = o.second;
-        if(!pK || pK->isBad() || idx < 0 || idx >= (int)pK->mvLines.size()) continue;
+        KeyFrame* pK = o.first;
+        if(!pK || pK->isBad()) continue;
+        for(int idx : o.second)
+        {
+        if(idx < 0 || idx >= (int)pK->mvLines.size()) continue;
         const LineObs &lo = pK->mvLines[idx];
         Sophus::SE3f Tc = pK->GetPose();
         if(lo.cam == 1 && pK->mpCamera2) Tc = pK->GetRelativePoseTrl() * Tc;
@@ -536,6 +543,7 @@ float LocalMapping::LineWorstObsResidual(MapLine* pML)
         for(const Eigen::Vector3f& b : {lo.b1u, lo.b2u})
             worst = std::max(worst, std::asin(std::min(1.f, std::fabs(n_c.dot(b)))));
         n++;
+        }
     }
     return (n >= 2) ? worst : -1.f;
 }
@@ -607,8 +615,9 @@ void LocalMapping::RemoveLineOutliers()
         for(auto &ob : pML->GetObservations())
         {
             KeyFrame* pK = ob.first;
-            const int idx = ob.second;
             if(!pK || pK->isBad()) continue;
+            for(int idx : ob.second)
+            {
             if(idx < 0 || idx >= (int)pK->mvLines.size()) continue;
             const LineObs &lo = pK->mvLines[idx];
             Sophus::SE3f Tc = pK->GetPose();
@@ -634,6 +643,8 @@ void LocalMapping::RemoveLineOutliers()
             }
             if(behind) break;
             nUsed++;
+            }
+            if(behind) break;
         }
         if(behind){ pML->SetBadFlag(); nBadCheir++; continue; }
         if(nUsed >= 2 && worst > kMaxErrPx){ pML->SetBadFlag(); nBadErr++; }

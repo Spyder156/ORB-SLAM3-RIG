@@ -1004,13 +1004,16 @@ void System::SaveMapLines(const string &filename)
             {
                 KeyFrame* pKFi = ob.first;
                 if(!pKFi || pKFi->isBad()) continue;
-                if(ob.second < 0 || ob.second >= (int)pKFi->mvLines.size()) continue;
-                const LineObs& lo = pKFi->mvLines[ob.second];
-                // plane normal in world: R_wc * n_c (lens pose = body here is
-                // WRONG for cam1... use cam0-only stat; rear lines report 0)
-                if(lo.cam != 0) continue;
-                Sophus::SE3f Tcw = pKFi->GetPose();
-                nw.push_back(Tcw.rotationMatrix().transpose() * lo.n);
+                for(int idx : ob.second)
+                {
+                    if(idx < 0 || idx >= (int)pKFi->mvLines.size()) continue;
+                    const LineObs& lo = pKFi->mvLines[idx];
+                    // plane normal in world: R_wc * n_c (lens pose = body here
+                    // is WRONG for cam1: cam0-only stat; rear lines report 0)
+                    if(lo.cam != 0) continue;
+                    Sophus::SE3f Tcw = pKFi->GetPose();
+                    nw.push_back(Tcw.rotationMatrix().transpose() * lo.n);
+                }
             }
             for(size_t i2 = 0; i2 < nw.size(); i2++)
                 for(size_t j2 = i2+1; j2 < nw.size(); j2++)

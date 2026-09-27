@@ -235,7 +235,9 @@ bool MapLine::Triangulate(const Eigen::Vector3f& n1_c, const Eigen::Matrix3f& Rc
 
 void MapLine::AddObservation(KeyFrame* pKF, int idx) {
     std::unique_lock<std::mutex> lk(mMutexFeatures);
-    mObservations[pKF] = idx;
+    std::vector<int>& v = mObservations[pKF];
+    for (int q : v) if (q == idx) return;   // fragment already registered
+    v.push_back(idx);
 }
 
 void MapLine::EraseObservation(KeyFrame* pKF) {
@@ -244,7 +246,7 @@ void MapLine::EraseObservation(KeyFrame* pKF) {
     if (mObservations.size() < 2) mbBad = true;
 }
 
-std::map<KeyFrame*, int> MapLine::GetObservations() {
+std::map<KeyFrame*, std::vector<int>> MapLine::GetObservations() {
     std::unique_lock<std::mutex> lk(mMutexFeatures);
     return mObservations;
 }
@@ -343,7 +345,7 @@ void MapLine::SetBadFlag() {
     // Mirror MapPoint::SetBadFlag: drop the landmark from every keyframe that
     // holds it AND from the map, not just flag it. A flagged-but-reachable
     // landmark keeps being drawn, keeps entering BA, and keeps voting.
-    std::map<KeyFrame*, int> obs;
+    std::map<KeyFrame*, std::vector<int>> obs;
     {
         std::unique_lock<std::mutex> lk(mMutexFeatures);
         std::unique_lock<std::mutex> lk2(mMutexPos);
@@ -351,7 +353,7 @@ void MapLine::SetBadFlag() {
         obs = mObservations;
         mObservations.clear();
     }
-    for (std::map<KeyFrame*, int>::iterator it = obs.begin(); it != obs.end(); it++)
+    for (auto it = obs.begin(); it != obs.end(); it++)
         if (it->first) it->first->EraseMapLineMatch(this);
     if (mpMap) mpMap->EraseMapLine(this);
 }

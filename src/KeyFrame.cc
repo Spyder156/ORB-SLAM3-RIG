@@ -324,6 +324,14 @@ void KeyFrame::EraseMapPointMatch(MapPoint* pMP)
 }
 
 
+void KeyFrame::SetLineObservations(const std::vector<LineObs>& v,
+                                   const std::vector<MapLine*>& m)
+{
+    unique_lock<mutex> lock(mMutexFeatures);
+    mvLines = v;
+    mvpMapLines = m;
+}
+
 void KeyFrame::EraseMapLineMatch(MapLine* pML)
 {
     // MapLine keeps ONE index per KF; null that slot. (Unlike points there is
