@@ -280,7 +280,21 @@ protected:
     // when off, nothing below runs and behaviour is bit-identical to before.
     LineExtractor* mpLineExtractor = nullptr;
     bool mbUseLines = false;
-    std::vector<LineObs> mvPrevLines;      ///< previous frame, for tracking
+    /// Persistent line trackers, one per lens: identity across frames,
+    /// surviving brief misses (gyro-predicted matching, appearance decides).
+    LineTracker mLineTracker[2];
+    int mnLinesCam0 = 0;                  ///< lens split of mCurrentFrame.mvLines
+    std::vector<int> mvLineAsg0, mvLineAsg1;   ///< per-lens track assignment
+    std::vector<char> mvLineMatched;      ///< per concatenated cur index
+    std::vector<Eigen::Vector3f> mvLinePrevN;  ///< matched track's last normal (audit)
+    std::vector<cv::Point2f> mvLinePrevP1;     ///< matched track's last p1 (audit)
+    /// Bias-corrected gyro rotation R_b(t0)_b(t1), integrated by PEEKING the
+    /// IMU queue -- never consuming it (PreintegrateIMU pops it later inside
+    /// Track(); consuming here would starve it).
+    Eigen::Matrix3f PeekGyroDeltaR(double t0, double t1);
+    /// Keyframe created this frame, held back until the post-Track() line
+    /// block finalises the frame's bindings (see CreateNewKeyFrame).
+    KeyFrame* mpPendingLineKF = nullptr;
     long mnLineMatches = 0, mnLineTotal = 0, mnLineTriangulated = 0;
     long mnLineObs = 0, mnLineRej = 0, mnLineInherited = 0, mnLineFromPts = 0;
     // stage-audit accumulators (Track thread only)
@@ -365,7 +379,6 @@ protected:
     int mnBlindInliers = 20;
     long mnBlindFrames = 0;
     std::vector<MapPoint*> mvpChargedVisible;
-    std::vector<int> mvLineAssign;   ///< cur->prev line match, computed pre-Track()
 
     //BoW
     ORBVocabulary* mpORBVocabulary;

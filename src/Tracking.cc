@@ -1780,55 +1780,77 @@ Sophus::SE3f Tracking::GrabImageMonoRig(const cv::Mat &im0, const cv::Mat &im1,
     if(mbUseLines && mpLineExtractor){
         std::vector<LineObs> l0 = mpLineExtractor->Extract(mImGray, mpCamera, 0);
         std::vector<LineObs> l1 = mpLineExtractor->Extract(imGrayRight, mpCamera2, 1);
+
+        // GYRO PREDICTION for the matcher: the rotation each lens underwent
+        // since the previous frame, from the raw (bias-corrected) gyro. The
+        // queue is PEEKED, not consumed -- PreintegrateIMU pops it later.
+        //   dR_cam = R_cb * dR_body^T * R_bc  takes prev-cam coords to cur-cam.
+        Eigen::Matrix3f dR0 = Eigen::Matrix3f::Identity();
+        Eigen::Matrix3f dR1 = Eigen::Matrix3f::Identity();
+        if(mLastFrame.mTimeStamp > 0 && mpImuCalib){
+            const Eigen::Matrix3f dRb = PeekGyroDeltaR(mLastFrame.mTimeStamp, timestamp);
+            const Eigen::Matrix3f Rbc0 = mpImuCalib->mTbc.rotationMatrix();
+            dR0 = Rbc0.transpose() * dRb.transpose() * Rbc0;
+            if(mpSystem->mRig.IsEnabled()){
+                // T_c1_c0 maps c0 -> c1, so R_b_c1 = R_b_c0 * R_c1_c0^T
+                const Eigen::Matrix3f Rbc1 =
+                    Rbc0 * mpSystem->mRig.T_c1_c0().rotationMatrix().transpose();
+                dR1 = Rbc1.transpose() * dRb.transpose() * Rbc1;
+            } else dR1 = dR0;
+        }
+
+        // PERSISTENT TRACKS, one tracker per lens: gyro-predict -> loose
+        // geometric shortlist -> appearance decides -> ambiguity checks.
+        // Match() inherits each matched track's identity (landmark, anchor,
+        // age) INTO the current observations before Track() runs, so the pose
+        // optimizer sees the associations on the frame that needs them.
+        mvLineAsg0 = mLineTracker[0].Match(l0, dR0);
+        mvLineAsg1 = mLineTracker[1].Match(l1, dR1);
+        mnLinesCam0 = (int)l0.size();
+
         mCurrentFrame.mvLines = l0;
         mCurrentFrame.mvLines.insert(mCurrentFrame.mvLines.end(), l1.begin(), l1.end());
         mCurrentFrame.mvpMapLines.assign(mCurrentFrame.mvLines.size(), nullptr);
         mCurrentFrame.mvbLineOutlier.assign(mCurrentFrame.mvLines.size(), false);
 
-        mvLineAssign = mpLineExtractor->Match(mCurrentFrame.mvLines, mvPrevLines);
-
-        // CARRY THE LANDMARK ASSOCIATIONS INTO THIS FRAME, BEFORE Track().
-        //
-        // This is the link that was missing. mvpMapLines was wiped to null just
-        // above, Track() ran the pose optimizer -- which skips every entry with
-        // `if(!pML) continue` -- and only AFTER that did the block below attach
-        // landmarks. So the associations existed on every frame except the one
-        // moment they were needed, and ZERO line edges ever reached the
-        // optimizer: verified as 0/400 optimizer calls with any line edge.
-        //
-        // The match above already says which previous line each current line
-        // is, and the previous line already carries its MapLine and its anchor
-        // view. Inheriting both here is all that was needed. Triangulation of
-        // genuinely NEW lines still happens after Track(), because that needs a
-        // pose which does not exist yet.
+        // matched-flag + previous-observation snapshots (audit), and landmark
+        // wiring with an isBad guard the tracker cannot do itself
+        mvLineMatched.assign(mCurrentFrame.mvLines.size(), 0);
+        mvLinePrevN.assign(mCurrentFrame.mvLines.size(), Eigen::Vector3f::Zero());
+        mvLinePrevP1.assign(mCurrentFrame.mvLines.size(), cv::Point2f(0, 0));
+        long m = 0, nInherit = 0;
+        for(size_t i = 0; i < mCurrentFrame.mvLines.size(); ++i)
         {
-            long nInherit = 0;
-            for(size_t i = 0; i < mvLineAssign.size(); ++i)
-            {
-                const int j = mvLineAssign[i];
-                if(j < 0 || j >= (int)mvPrevLines.size()) continue;
-                LineObs &cur = mCurrentFrame.mvLines[i];
-                const LineObs &prv = mvPrevLines[j];
-                if(prv.hasAnchor)
-                {
-                    cur.hasAnchor = true;
-                    cur.nAnchor = prv.nAnchor;
-                    cur.RAnchor = prv.RAnchor;
-                    cur.tAnchor = prv.tAnchor;
-                    cur.anchorMapVersion = prv.anchorMapVersion;
-                }
-                if(prv.pML && !prv.pML->isBad())
-                {
-                    cur.pML = prv.pML;
-                    mCurrentFrame.mvpMapLines[i] = prv.pML;
-                    nInherit++;
-                }
-            }
-            mnLineInherited += nInherit;
+            const bool c0 = (int)i < mnLinesCam0;
+            const int a = c0 ? mvLineAsg0[i] : mvLineAsg1[i - mnLinesCam0];
+            if(a < 0) continue;
+            const LineTracker& trk = mLineTracker[c0 ? 0 : 1];
+            mvLineMatched[i] = 1;
+            mvLinePrevN[i] = trk.Tracks()[a].last.n;
+            mvLinePrevP1[i] = trk.Tracks()[a].last.p1;
+            LineObs &cur = mCurrentFrame.mvLines[i];
+            if(cur.pML && cur.pML->isBad()) cur.pML = nullptr;
+            if(cur.pML){ mCurrentFrame.mvpMapLines[i] = cur.pML; nInherit++; }
+            ++m;
         }
-        const std::vector<int> &a = mvLineAssign;
-        long m = 0;
-        for(size_t i = 0; i < a.size(); ++i) if(a[i] >= 0) ++m;
+        mnLineInherited += nInherit;
+        {   // which rule killed the rejections -- per-lens counters
+            static long nfs = 0;
+            if(++nfs % 200 == 0){
+                const auto &s0 = mLineTracker[0].mStats, &s1 = mLineTracker[1].mStats;
+                std::cout << "[AUDIT] track match: cand " << s0.nCand + s1.nCand
+                          << " | kill normal " << s0.killNormal + s1.killNormal
+                          << " orth " << s0.killOrth + s1.killOrth
+                          << " overlap " << s0.killOverlap + s1.killOverlap
+                          << " polarity " << s0.killPolarity + s1.killPolarity
+                          << " abs " << s0.killAbs + s1.killAbs
+                          << " ratio " << s0.killRatio + s1.killRatio
+                          << " | matched " << s0.matched + s1.matched
+                          << " fresh " << s0.fresh + s1.fresh
+                          << " live " << mLineTracker[0].Tracks().size()
+                                       + mLineTracker[1].Tracks().size() << std::endl;
+            }
+        }
         mnLineMatches += m; mnLineTotal += (long)mCurrentFrame.mvLines.size();
         static long nf = 0;
         if(++nf % 200 == 0)
@@ -1923,49 +1945,34 @@ Sophus::SE3f Tracking::GrabImageMonoRig(const cv::Mat &im0, const cv::Mat &im1,
                     lensPts[lc].push_back({Xc / r, Xw, pMP});
                 }
             }
-            const std::vector<int> &a = mvLineAssign;
-            for(size_t i = 0; i < a.size(); ++i)
+            for(size_t i = 0; i < mCurrentFrame.mvLines.size(); ++i)
             {
                 LineObs &cur = mCurrentFrame.mvLines[i];
                 // pose of the LENS that made this observation
                 Sophus::SE3f Tc = Tcw_cur;
                 if(cur.cam == 1) Tc = T_c1 * Tc;
 
-                if(a[i] < 0 || a[i] >= (int)mvPrevLines.size()){
-                    // new track: anchor it here
+                // anchor + age + landmark were inherited by the TRACKER before
+                // Track(); anything still unanchored (fresh track, or a track
+                // that never got one) is anchored at this frame's pose.
+                if(!cur.hasAnchor){
                     cur.hasAnchor = true; cur.nAnchor = cur.n;
                     cur.RAnchor = Tc.rotationMatrix(); cur.tAnchor = Tc.translation();
                     cur.anchorMapVersion = mpAtlas->GetCurrentMap()->GetWorldFrameVersion();
-                    continue;
+                    if(!mvLineMatched[i]) continue;   // brand new: nothing to reobserve
                 }
-                const LineObs &prv = mvPrevLines[a[i]];
-                if(cur.cam != prv.cam) continue;           // never mix lenses
-                if(!prv.hasAnchor){
-                    cur.hasAnchor = true; cur.nAnchor = cur.n;
-                    cur.RAnchor = Tc.rotationMatrix(); cur.tAnchor = Tc.translation();
-                    cur.anchorMapVersion = mpAtlas->GetCurrentMap()->GetWorldFrameVersion();
-                    continue;
-                }
-                // anchor and landmark were already inherited before Track();
-                // only fill an anchor here if the previous line never had one.
-                if(!cur.hasAnchor)
-                {
-                    cur.hasAnchor = true; cur.nAnchor = prv.nAnchor;
-                    cur.RAnchor = prv.RAnchor; cur.tAnchor = prv.tAnchor;
-                    cur.anchorMapVersion = prv.anchorMapVersion;
-                }
-                cur.nSeen = prv.nSeen + 1;      // track age, for LINE_MIN_OBS
 
                 {   // [AUDIT-B] match quality on CONSECUTIVE frames: the
                     // angle between the two camera-frame normals and how far
                     // the endpoints moved in pixels. 33 ms apart, both should
                     // be small; large values = the matcher grabbed a different
                     // physical line.
-                    const LineObs &pv = mvPrevLines[a[i]];
-                    audNAng += std::asin(std::min(1.f,
-                        cur.n.cross(pv.n).norm()));
-                    audPxMove += cv::norm(cur.p1 - pv.p1);
-                    audNMatch++;
+                    if(mvLineMatched[i]){
+                        audNAng += std::asin(std::min(1.f,
+                            cur.n.cross(mvLinePrevN[i]).norm()));
+                        audPxMove += cv::norm(cur.p1 - mvLinePrevP1[i]);
+                        audNMatch++;
+                    }
                 }
                 if(cur.pML){
                     // Already a landmark: this is another OBSERVATION of it, not
@@ -2533,7 +2540,18 @@ Sophus::SE3f Tracking::GrabImageMonoRig(const cv::Mat &im0, const cv::Mat &im1,
             }
         }
 
-        mvPrevLines = mCurrentFrame.mvLines;
+        // COMMIT the frame's final observations (landmarks, anchors,
+        // triangulations all attached by now) back into their tracks, and
+        // spawn tracks for the unmatched. Identity survives here, not in a
+        // previous-frame snapshot.
+        {
+            std::vector<LineObs> f0(mCurrentFrame.mvLines.begin(),
+                                    mCurrentFrame.mvLines.begin() + mnLinesCam0);
+            std::vector<LineObs> f1(mCurrentFrame.mvLines.begin() + mnLinesCam0,
+                                    mCurrentFrame.mvLines.end());
+            mLineTracker[0].Commit(f0, mvLineAsg0);
+            mLineTracker[1].Commit(f1, mvLineAsg1);
+        }
         sLineMs2.push_back(std::chrono::duration<double,std::milli>(
             std::chrono::steady_clock::now()-tL1).count());
         if(sLineMs2.size() % 200 == 0){
@@ -2546,6 +2564,16 @@ Sophus::SE3f Tracking::GrabImageMonoRig(const cv::Mat &im0, const cv::Mat &im1,
                       << " p95 " << pct(sLineMs2,0.95)
                       << "  (budget 33)" << std::endl;
         }
+    }
+
+    if(mpPendingLineKF)
+    {
+        // this frame created a keyframe: hand it the FINAL line bindings and
+        // only now let LocalMapping see it
+        mpPendingLineKF->SetLineObservations(mCurrentFrame.mvLines,
+                                             mCurrentFrame.mvpMapLines);
+        mpLocalMapper->InsertKeyFrame(mpPendingLineKF);
+        mpPendingLineKF = nullptr;
     }
 
     return mCurrentFrame.GetPose();
@@ -2607,6 +2635,30 @@ void Tracking::GrabImuData(const IMU::Point &imuMeasurement)
 {
     unique_lock<mutex> lock(mMutexImuQueue);
     mlQueueImuData.push_back(imuMeasurement);
+}
+
+Eigen::Matrix3f Tracking::PeekGyroDeltaR(double t0, double t1)
+{
+    // R_b(t0)_b(t1): body rotation over (t0,t1], product of Exp((w-bg)*dt)
+    // over the queued gyro samples. PEEK only -- the queue is consumed later
+    // by PreintegrateIMU inside Track(); consuming it twice starves it.
+    // Bias: mLastBias, the last vision-accepted estimate (zero pre-init, and
+    // that is fine -- prediction only has to beat assuming zero rotation).
+    Eigen::Matrix3f R = Eigen::Matrix3f::Identity();
+    const Eigen::Vector3f bg(mLastBias.bwx, mLastBias.bwy, mLastBias.bwz);
+    std::unique_lock<std::mutex> lock(mMutexImuQueue);
+    double tPrev = t0;
+    for(const IMU::Point& p : mlQueueImuData)
+    {
+        if(p.t <= t0) continue;
+        const double tEnd = std::min(p.t, t1);
+        const float dt = float(tEnd - tPrev);
+        if(dt > 0.f)
+            R = R * Sophus::SO3f::exp((p.w - bg) * dt).matrix();
+        tPrev = tEnd;
+        if(p.t >= t1) break;
+    }
+    return R;
 }
 
 void Tracking::PreintegrateIMU()
@@ -3771,6 +3823,10 @@ void Tracking::CreateMapInAtlas()
     mbCoastArmed = false;
     mnGoodStreak = 0;
     mpCoastAnchorKF = nullptr;
+    // line tracks hold landmark pointers of the abandoned map
+    mLineTracker[0].Reset();
+    mLineTracker[1].Reset();
+    mpPendingLineKF = nullptr;   // belongs to the abandoned map, never publish
 
     mbCreatedMap = true;
 }
@@ -4488,7 +4544,15 @@ void Tracking::CreateNewKeyFrame()
     }
 
 
-    mpLocalMapper->InsertKeyFrame(pKF);
+    if(mbUseLines)
+        // publish AFTER the post-Track() line block finalises this frame's
+        // bindings (triangulation, validation, re-acquisition): the snapshot
+        // taken by the constructor just above is stale by then, and
+        // LocalMapping registers observations from whatever the keyframe
+        // holds when it dequeues it.
+        mpPendingLineKF = pKF;
+    else
+        mpLocalMapper->InsertKeyFrame(pKF);
 
     mpLocalMapper->SetNotStop(false);
 
@@ -5033,6 +5097,8 @@ void Tracking::Reset(bool bLocMap)
     mbCoastArmed = false;
     mnGoodStreak = 0;
     mpCoastAnchorKF = nullptr;
+    mLineTracker[0].Reset();
+    mLineTracker[1].Reset();
 
     if(mpViewer)
         mpViewer->Release();
@@ -5086,6 +5152,8 @@ void Tracking::ResetActiveMap(bool bLocMap)
     mbCoastArmed = false;
     mnGoodStreak = 0;
     mpCoastAnchorKF = nullptr;
+    mLineTracker[0].Reset();
+    mLineTracker[1].Reset();
 
     list<bool> lbLost;
     // lbLost.reserve(mlbLost.size());
