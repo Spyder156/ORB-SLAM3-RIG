@@ -179,6 +179,7 @@ public:
     /// line's version of what BA does for points. Invalidated when the world
     /// frame is re-expressed (the stored pose would be in the old frame).
     Eigen::Vector3f mFirstN = Eigen::Vector3f::Zero();
+    float mFirstSigma = 0.0175f;  ///< 1-sigma normal noise of that observation [rad]
     Eigen::Matrix3f mFirstR = Eigen::Matrix3f::Identity();
     Eigen::Vector3f mFirstT = Eigen::Vector3f::Zero();
     bool mbHasFirst = false;

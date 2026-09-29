@@ -1959,6 +1959,7 @@ Sophus::SE3f Tracking::GrabImageMonoRig(const cv::Mat &im0, const cv::Mat &im1,
                     cur.hasAnchor = true; cur.nAnchor = cur.n;
                     cur.RAnchor = Tc.rotationMatrix(); cur.tAnchor = Tc.translation();
                     cur.anchorMapVersion = mpAtlas->GetCurrentMap()->GetWorldFrameVersion();
+                    cur.anchorSigma = LineExtractor::NormalSigma(cur);
                     if(!mvLineMatched[i]) continue;   // brand new: nothing to reobserve
                 }
 
@@ -2049,10 +2050,13 @@ Sophus::SE3f Tracking::GrabImageMonoRig(const cv::Mat &im0, const cv::Mat &im1,
                                     n1w.cross(n2w).norm());
                                 if(std::asin(sinp) > 1.2f * pL->mCreateParallax){
                                     Eigen::Vector3f dw2, mw2;
+                                    const float minDeg2 = std::max(2.0f,
+                                        3.f * (LineExtractor::NormalSigma(cur)
+                                               + pL->mFirstSigma) * 180.f / float(M_PI));
                                     if(MapLine::Triangulate(cur.n,
                                            Tc.rotationMatrix(), Tc.translation(),
                                            pL->mFirstN, pL->mFirstR, pL->mFirstT,
-                                           2.0f, dw2, mw2)){
+                                           minDeg2, dw2, mw2)){
                                         const Eigen::Vector3f d_c2 =
                                             Tc.rotationMatrix() * dw2;
                                         const Eigen::Vector3f m_c2 =
@@ -2120,6 +2124,7 @@ Sophus::SE3f Tracking::GrabImageMonoRig(const cv::Mat &im0, const cv::Mat &im1,
                         cur.RAnchor = Tc.rotationMatrix();
                         cur.tAnchor = Tc.translation();
                         cur.anchorMapVersion = nowV;
+                        cur.anchorSigma = LineExtractor::NormalSigma(cur);
                         continue;
                     }
                 }
@@ -2240,10 +2245,18 @@ Sophus::SE3f Tracking::GrabImageMonoRig(const cv::Mat &im0, const cv::Mat &im1,
                 // ray pointing away from the camera. If so, refusing to create
                 // them should remove the starburst entirely.
                 if(mbLinePointsOnly && !bFromPoints){ nRej++; continue; }
+                // The conditioning floor scales with the NOISE of the two
+                // plane normals (sqrt(2)px / segment length each): a constant
+                // 2 deg floor let short segments triangulate directions from
+                // pure noise -- measured as horizontal directions at isotropic
+                // chance while every plane residual passed.
+                const float minTriDeg = std::max(2.0f,
+                    3.f * (LineExtractor::NormalSigma(cur) + cur.anchorSigma)
+                        * 180.f / float(M_PI));
                 if(!bFromPoints &&
                    !MapLine::Triangulate(cur.n, Tc.rotationMatrix(), Tc.translation(),
                                          cur.nAnchor, cur.RAnchor, cur.tAnchor,
-                                         2.0f, dw, mw))
+                                         minTriDeg, dw, mw))
                     continue;      // still too little angle -- keep accumulating
 
                 // (The former DIRECTION GATE -- triangulated direction vs the
@@ -2298,6 +2311,7 @@ Sophus::SE3f Tracking::GrabImageMonoRig(const cv::Mat &im0, const cv::Mat &im1,
                 pML->mAngLen = cur.angLen;
                 pML->mnCam = cur.cam;
                 pML->mFirstN = cur.nAnchor;
+                pML->mFirstSigma = cur.anchorSigma;
                 pML->mFirstR = cur.RAnchor;
                 pML->mFirstT = cur.tAnchor;
                 pML->mbHasFirst = true;

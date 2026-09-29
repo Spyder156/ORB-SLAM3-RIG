@@ -62,6 +62,11 @@ public:
     /// endpoint bearing from the line's current predicted plane, across all
     /// keyframe observations. Negative if fewer than 2 usable observations.
     static float LineWorstObsResidual(MapLine* pML);
+    /// Can this line's DIRECTION actually be determined from its observation
+    /// planes, against their own noise? The plane residual cannot answer this
+    /// (any direction inside a thin sheaf fits every plane); a line failing
+    /// here has a noise direction and must not be exported as verified.
+    static bool LineDirectionObservable(MapLine* pML);
 
     /// Lines.outlierCull / Lines.culling in the settings file (default on).
     /// Off isolates the residual change from the culling passes for A/B tests.

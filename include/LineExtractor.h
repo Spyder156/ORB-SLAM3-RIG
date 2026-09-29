@@ -45,6 +45,8 @@ struct LineObs {
     // Triangulating against the anchor rather than the previous frame is what
     // gives the two interpretation planes enough angle to intersect.
     bool hasAnchor = false;
+    /// 1-sigma noise of the ANCHOR observation's plane normal [rad]
+    float anchorSigma = 0.0175f;
     /// How many consecutive frames this track has survived. PL-VINS refuses to
     /// triangulate a line until LINE_MIN_OBS (5) frames have seen it -- a
     /// 2-frame line carries no usable depth however good its parallax looks.
@@ -123,6 +125,15 @@ public:
                                       LineObs& o);
     /// L2 distance between normalised band profiles (2.0 = worst).
     static float DescDist(const float a[4], const float b[4]);
+    /// 1-sigma noise of this observation's plane NORMAL [rad]:
+    /// sqrt(2)*sigma_px / segment_pixel_length. A direction claim must clear
+    /// MULTIPLES of this or it is noise -- measured: horizontal directions at
+    /// isotropic chance (11%) while every residual audit passed, because the
+    /// plane residual is blind to direction inside a thin sheaf.
+    static float NormalSigma(const LineObs& o) {
+        const float lenPx = o.angLen * o.pxPerRad;
+        return 1.41421356f / (lenPx > 5.f ? lenPx : 5.f);
+    }
 
     float mMinAngLen, mMaxAngLen;   ///< [rad]
     float mGateNormal, mGateDir;    ///< [rad]

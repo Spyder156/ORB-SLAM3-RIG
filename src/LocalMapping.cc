@@ -410,7 +410,7 @@ void LocalMapping::RetriangulateLines()
 float LocalMapping::RefineLineFromObservations(MapLine* pML)
 {
     // gather this landmark's observations, each as a world-frame plane
-    struct Ob { Eigen::Vector3f nw, nc, t; Eigen::Matrix3f R; Eigen::Vector3f b1, b2; };
+    struct Ob { Eigen::Vector3f nw, nc, t; Eigen::Matrix3f R; Eigen::Vector3f b1, b2; float sig; };
     std::vector<Ob> obs;
     for(auto &o : pML->GetObservations())
     {
@@ -425,6 +425,7 @@ float LocalMapping::RefineLineFromObservations(MapLine* pML)
             Ob ob; ob.R = Tc.rotationMatrix(); ob.t = Tc.translation();
             ob.nc = lo.n; ob.nw = ob.R.transpose() * lo.n;
             ob.b1 = lo.b1u; ob.b2 = lo.b2u;
+            ob.sig = LineExtractor::NormalSigma(lo);
             obs.push_back(ob);
         }
     }
@@ -460,10 +461,16 @@ float LocalMapping::RefineLineFromObservations(MapLine* pML)
     if(obs.size() >= 3)
     {
         Eigen::Matrix3f N = Eigen::Matrix3f::Zero();
-        for(const Ob& ob : obs) N += ob.nw * ob.nw.transpose();
+        float sumSig2 = 0.f;
+        for(const Ob& ob : obs){ N += ob.nw * ob.nw.transpose(); sumSig2 += ob.sig * ob.sig; }
         Eigen::SelfAdjointEigenSolver<Eigen::Matrix3f> esN(N);
         const Eigen::Vector3f ev = esN.eigenvalues();   // ascending
-        if(ev(1) > 5.f * ev(0) + 1e-6f)                 // direction observable
+        // lambda2 measures how much the planes genuinely ROTATE; for pure
+        // noise it is ~ sum(sigma^2). Demand 3-sigma-squared clearance. The
+        // old test (lambda2 > 5*lambda1) compared noise WITH noise: for a
+        // thin sheaf both eigenvalues are noise-sized and the ratio is a
+        // coin flip -- how the map filled with chance-direction lines.
+        if(ev(1) > 9.f * sumSig2)                       // direction observable
         {
             const Eigen::Vector3f d = esN.eigenvectors().col(0);
             Eigen::Matrix3f A = d * d.transpose();      // gauge: p.d = 0
@@ -490,10 +497,12 @@ float LocalMapping::RefineLineFromObservations(MapLine* pML)
             if(a > best){ best = a; bi = (int)i; bj = (int)j; }
         }
     if(bi < 0) return residOld;
+    const float minDeg = std::max(2.0f,
+        3.f * (obs[bi].sig + obs[bj].sig) * 180.f / float(M_PI));
     if(!solved &&
        !MapLine::Triangulate(obs[bi].nc, obs[bi].R, obs[bi].t,
                              obs[bj].nc, obs[bj].R, obs[bj].t,
-                             2.0f, dw, mw)) return residOld;
+                             minDeg, dw, mw)) return residOld;
 
     // the re-solve must actually explain the observations better
     const float residNew = maxResid(dw, mw);
@@ -548,6 +557,42 @@ float LocalMapping::LineWorstObsResidual(MapLine* pML)
     return (n >= 2) ? worst : -1.f;
 }
 
+bool LocalMapping::LineDirectionObservable(MapLine* pML)
+{
+    // gather world-frame plane normals + their noise
+    std::vector<std::pair<Eigen::Vector3f, float>> planes;
+    for(auto &o : pML->GetObservations())
+    {
+        KeyFrame* pK = o.first;
+        if(!pK || pK->isBad()) continue;
+        for(int idx : o.second)
+        {
+            if(idx < 0 || idx >= (int)pK->mvLines.size()) continue;
+            const LineObs &lo = pK->mvLines[idx];
+            Sophus::SE3f Tc = pK->GetPose();
+            if(lo.cam == 1 && pK->mpCamera2) Tc = pK->GetRelativePoseTrl() * Tc;
+            planes.push_back({Tc.rotationMatrix().transpose() * lo.n,
+                              LineExtractor::NormalSigma(lo)});
+        }
+    }
+    if(planes.size() < 2) return false;
+    // multiview: the planes must rotate beyond their own noise
+    Eigen::Matrix3f N = Eigen::Matrix3f::Zero();
+    float sumSig2 = 0.f;
+    for(auto &p : planes){ N += p.first * p.first.transpose(); sumSig2 += p.second * p.second; }
+    Eigen::SelfAdjointEigenSolver<Eigen::Matrix3f> es(N);
+    if(es.eigenvalues()(1) > 9.f * sumSig2) return true;
+    // pair: any two planes separated by 3x their combined noise
+    for(size_t i = 0; i < planes.size(); i++)
+        for(size_t j = i + 1; j < planes.size(); j++)
+        {
+            const float sep = std::asin(std::min(1.f,
+                planes[i].first.cross(planes[j].first).norm()));
+            if(sep > 3.f * (planes[i].second + planes[j].second)) return true;
+        }
+    return false;
+}
+
 void LocalMapping::RevalidateMapLines(Map* pMap, bool bDelete)
 {
     // Every line, whole map: does the stored geometry still explain the
@@ -571,7 +616,17 @@ void LocalMapping::RevalidateMapLines(Map* pMap, bool bDelete)
         else
             r = RefineLineFromObservations(pML);
         if(r < 0.f){ pML->mnGeomVerdict = 0; nCand++; continue; }  // candidate
-        if(r <= kMaxRad){ pML->mnGeomVerdict = 1; nOk++; }
+        if(r <= kMaxRad){
+            // Residual only proves the line lies in its observation planes;
+            // it is BLIND to the direction inside a thin sheaf. Verified
+            // additionally requires the direction to be determinable: from
+            // support points, or from planes that rotate beyond their noise.
+            if(pML->mbSupportFitOk || LineDirectionObservable(pML)){
+                pML->mnGeomVerdict = 1; nOk++;
+            } else {
+                pML->mnGeomVerdict = 0; nCand++;   // plane-constraint only
+            }
+        }
         else {
             pML->mnGeomVerdict = -1;
             nBad++;

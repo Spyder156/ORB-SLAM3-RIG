@@ -464,6 +464,7 @@ std::vector<int> LineTracker::Match(std::vector<LineObs>& cur,
             o.hasAnchor = true;
             o.nAnchor = pl.nAnchor; o.RAnchor = pl.RAnchor;
             o.tAnchor = pl.tAnchor; o.anchorMapVersion = pl.anchorMapVersion;
+            o.anchorSigma = pl.anchorSigma;
         }
         o.nSeen = pl.nSeen + 1;
     }
