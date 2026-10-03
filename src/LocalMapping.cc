@@ -899,7 +899,11 @@ void LocalMapping::CreateNewMapPoints()
             const cv::KeyPoint &kp1 = (mpCurrentKeyFrame -> NLeft == -1) ? mpCurrentKeyFrame->mvKeysUn[idx1]
                                                                          : (idx1 < mpCurrentKeyFrame -> NLeft) ? mpCurrentKeyFrame -> mvKeys[idx1]
                                                                                                                : mpCurrentKeyFrame -> mvKeysRight[idx1 - mpCurrentKeyFrame -> NLeft];
-            const float kp1_ur=mpCurrentKeyFrame->mvuRight[idx1];
+            // Rectified disparity exists only for the SINGLE-camera stereo
+            // model. With two cameras the indices are pooled (left then right),
+            // while mvuRight is left-sized -- a right index reads past its end.
+            const float kp1_ur = !mpCurrentKeyFrame->mpCamera2
+                    ? mpCurrentKeyFrame->mvuRight[idx1] : -1.0f;
             bool bStereo1 = (!mpCurrentKeyFrame->mpCamera2 && kp1_ur>=0);
             const bool bRight1 = (mpCurrentKeyFrame -> NLeft == -1 || idx1 < mpCurrentKeyFrame -> NLeft) ? false
                                                                                                          : true;
@@ -908,7 +912,8 @@ void LocalMapping::CreateNewMapPoints()
                                                             : (idx2 < pKF2 -> NLeft) ? pKF2 -> mvKeys[idx2]
                                                                                      : pKF2 -> mvKeysRight[idx2 - pKF2 -> NLeft];
 
-            const float kp2_ur = pKF2->mvuRight[idx2];
+            const float kp2_ur = !pKF2->mpCamera2
+                    ? pKF2->mvuRight[idx2] : -1.0f;
             bool bStereo2 = (!pKF2->mpCamera2 && kp2_ur>=0);
             const bool bRight2 = (pKF2 -> NLeft == -1 || idx2 < pKF2 -> NLeft) ? false
                                                                                : true;
@@ -1369,7 +1374,15 @@ void LocalMapping::KeyFrameCulling()
                 {
                     if(!mbMonocular)
                     {
-                        if(pKF->mvDepth[i]>pKF->mThDepth || pKF->mvDepth[i]<0)
+                        // Depth is stored at the LEFT feature only. A pooled
+                        // right observation reaches it through its stereo
+                        // correspondence, never through its pooled index.
+                        int depthIndex = static_cast<int>(i);
+                        if(pKF->NLeft != -1 && depthIndex >= pKF->NLeft)
+                            depthIndex = pKF->mvRightToLeftMatch[depthIndex - pKF->NLeft];
+                        if(depthIndex < 0)
+                            continue;   // right feature with no stereo depth
+                        if(pKF->mvDepth[depthIndex]>pKF->mThDepth || pKF->mvDepth[depthIndex]<0)
                             continue;
                     }
 
