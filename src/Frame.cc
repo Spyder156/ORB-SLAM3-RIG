@@ -17,6 +17,7 @@
 */
 
 #include "Frame.h"
+#include <algorithm>
 #include "Rig.h"
 
 #include "G2oTypes.h"
@@ -1143,13 +1144,10 @@ void Frame::ComputeStereoFishEyeMatches() {
         return;
     }
 
-    //Speed it up by matching keypoints in the lapping area
-    vector<cv::KeyPoint> stereoLeft(mvKeys.begin() + monoLeft, mvKeys.end());
-    vector<cv::KeyPoint> stereoRight(mvKeysRight.begin() + monoRight, mvKeysRight.end());
-
-    cv::Mat stereoDescLeft = mDescriptors.rowRange(monoLeft, mDescriptors.rows);
-    cv::Mat stereoDescRight = mDescriptorsRight.rowRange(monoRight, mDescriptorsRight.rows);
-
+    // Publish well-formed EMPTY arrays FIRST, then bail on degenerate frames.
+    // The rowRange() calls below are only valid once we know the descriptor
+    // matrices are non-empty and monoLeft/monoRight are in range -- a dark
+    // frame with no descriptors crashed here.
     mvLeftToRightMatch = vector<int>(Nleft,-1);
     mvRightToLeftMatch = vector<int>(Nright,-1);
     mvDepth = vector<float>(Nleft,-1.0f);
@@ -1157,29 +1155,49 @@ void Frame::ComputeStereoFishEyeMatches() {
     mvStereo3Dpoints = vector<Eigen::Vector3f>(Nleft);
     mnCloseMPs = 0;
 
+    if(mDescriptors.empty() || mDescriptorsRight.empty() ||
+       monoLeft < 0 || monoLeft >= mDescriptors.rows ||
+       monoRight < 0 || monoRight > mDescriptorsRight.rows-2)
+        return;
+
+    //Speed it up by matching keypoints in the lapping area
+    cv::Mat stereoDescLeft = mDescriptors.rowRange(monoLeft, mDescriptors.rows);
+    cv::Mat stereoDescRight = mDescriptorsRight.rowRange(monoRight, mDescriptorsRight.rows);
+
     //Perform a brute force between Keypoint in the left and right image
     vector<vector<cv::DMatch>> matches;
 
     BFmatcher.knnMatch(stereoDescLeft,stereoDescRight,matches,2);
 
-    int nMatches = 0;
-    int descMatches = 0;
+    // RECIPROCAL, BEST-FIRST OWNERSHIP. Upstream writes every ratio-passing
+    // match straight into the arrays, so a later (worse) candidate overwrites
+    // an earlier claim on the same right feature, and a candidate whose
+    // geometric test FAILS still consumed its chance. Consider best descriptor
+    // distance first and let only a geometric success reserve the target.
+    vector<cv::DMatch> candidates;
+    candidates.reserve(matches.size());
+    for(const auto& neighbors : matches)
+        if(neighbors.size() >= 2 && neighbors[0].distance < neighbors[1].distance*0.7f)
+            candidates.push_back(neighbors[0]);
+    std::stable_sort(candidates.begin(), candidates.end(),
+        [](const cv::DMatch& a, const cv::DMatch& b){ return a.distance < b.distance; });
 
-    //Check matches using Lowe's ratio
-    for(vector<vector<cv::DMatch>>::iterator it = matches.begin(); it != matches.end(); ++it){
-        if((*it).size() >= 2 && (*it)[0].distance < (*it)[1].distance * 0.7){
-            //For every good match, check parallax and reprojection error to discard spurious matches
-            Eigen::Vector3f p3D;
-            descMatches++;
-            float sigma1 = mvLevelSigma2[mvKeys[(*it)[0].queryIdx + monoLeft].octave], sigma2 = mvLevelSigma2[mvKeysRight[(*it)[0].trainIdx + monoRight].octave];
-            float depth = static_cast<KannalaBrandt8*>(mpCamera)->TriangulateMatches(mpCamera2,mvKeys[(*it)[0].queryIdx + monoLeft],mvKeysRight[(*it)[0].trainIdx + monoRight],mRlr,mtlr,sigma1,sigma2,p3D);
-            if(depth > 0.0001f){
-                mvLeftToRightMatch[(*it)[0].queryIdx + monoLeft] = (*it)[0].trainIdx + monoRight;
-                mvRightToLeftMatch[(*it)[0].trainIdx + monoRight] = (*it)[0].queryIdx + monoLeft;
-                mvStereo3Dpoints[(*it)[0].queryIdx + monoLeft] = p3D;
-                mvDepth[(*it)[0].queryIdx + monoLeft] = depth;
-                nMatches++;
-            }
+    for(const cv::DMatch& match : candidates) {
+        const int leftIndex = match.queryIdx + monoLeft;
+        const int rightIndex = match.trainIdx + monoRight;
+        if(mvRightToLeftMatch[rightIndex] != -1)
+            continue;                       // already claimed by a better match
+        Eigen::Vector3f p3D;
+        const float sigma1 = mvLevelSigma2[mvKeys[leftIndex].octave];
+        const float sigma2 = mvLevelSigma2[mvKeysRight[rightIndex].octave];
+        const float depth = static_cast<KannalaBrandt8*>(mpCamera)->TriangulateMatches(
+            mpCamera2, mvKeys[leftIndex], mvKeysRight[rightIndex], mRlr, mtlr,
+            sigma1, sigma2, p3D);
+        if(depth > 0.0001f) {
+            mvLeftToRightMatch[leftIndex] = rightIndex;
+            mvRightToLeftMatch[rightIndex] = leftIndex;
+            mvStereo3Dpoints[leftIndex] = p3D;
+            mvDepth[leftIndex] = depth;
         }
     }
 }
