@@ -2203,13 +2203,32 @@ int Optimizer::OptimizeSim3(KeyFrame *pKF1, KeyFrame *pKF2, vector<MapPoint *> &
         if(!vpMatches1[i])
             continue;
 
+        // This solver's pose and projection edges are CAMERA 0's. With pooled
+        // two-camera indices, an i >= NLeft is a camera1 feature: using it here
+        // indexes camera0's keypoint arrays and constrains camera0's ray with a
+        // measurement the other lens made.
+        if(pKF1->NLeft != -1 && (int)i >= pKF1->NLeft)
+        {
+            vpMatches1[i] = nullptr;
+            continue;
+        }
+
         MapPoint* pMP1 = vpMapPoints1[i];
         MapPoint* pMP2 = vpMatches1[i];
 
         const int id1 = 2*i+1;
         const int id2 = 2*(i+1);
 
-        const int i2 = get<0>(pMP2->GetIndexInKeyFrame(pKF2));
+        const auto indices2 = pMP2->GetIndexInKeyFrame(pKF2);
+        const int i2 = get<0>(indices2);
+        // A camera1-only observation in KF2 is not a camera0 measurement
+        // either; drop it rather than feed it to the camera0 edge. (The
+        // genuinely-absent-keyframe path below is left intact.)
+        if(pKF2->mpCamera2 && i2 < 0 && get<1>(indices2) >= 0)
+        {
+            vpMatches1[i] = nullptr;
+            continue;
+        }
 
         Eigen::Vector3f P3D1c;
         Eigen::Vector3f P3D2c;
@@ -2306,9 +2325,12 @@ int Optimizer::OptimizeSim3(KeyFrame *pKF1, KeyFrame *pKF2, vector<MapPoint *> &
         }
         else
         {
-            float invz = 1/P3D2c(2);
-            float x = P3D2c(0)*invz;
-            float y = P3D2c(1)*invz;
+            // The inverse Sim3 edge predicts PIXELS; the upstream code supplied
+            // normalised X/Z, Y/Z for the synthesized missing-neighbour
+            // observation, so that residual mixed two different units.
+            const Eigen::Vector2f uv2 = pKF2->mpCamera->project(P3D2c);
+            const float x = uv2.x();
+            const float y = uv2.y();
 
             obs2 << x, y;
             kpUn2 = cv::KeyPoint(cv::Point2f(x, y), pMP2->mnTrackScaleLevel);
