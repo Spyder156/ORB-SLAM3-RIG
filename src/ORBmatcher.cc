@@ -1081,6 +1081,13 @@ namespace ORB_SLAM3
                         const cv::KeyPoint &kp2 = (pKF2 -> NLeft == -1) ? pKF2->mvKeysUn[bestIdx2]
                                                                         : (bestIdx2 < pKF2 -> NLeft) ? pKF2 -> mvKeys[bestIdx2]
                                                                                                      : pKF2 -> mvKeysRight[bestIdx2 - pKF2 -> NLeft];
+                        // RESERVE the target. Upstream declares vbMatched2 and
+                        // never sets it, so one keyframe-2 feature can be claimed
+                        // by several keyframe-1 features; the later triangulation
+                        // writes both landmarks into the SAME observation slot and
+                        // one silently overwrites the other (measured elsewhere at
+                        // 72 duplicate claims in 596 accepted triangulations).
+                        vbMatched2[bestIdx2]=true;
                         vMatches12[idx1]=bestIdx2;
                         nmatches++;
 
@@ -1269,7 +1276,9 @@ namespace ORB_SLAM3
                 if(kpLevel<nPredictedLevel-1 || kpLevel>nPredictedLevel)
                     continue;
 
-                if(pKF->mvuRight[idx]>=0)
+                // Rectified disparity belongs only to the single-camera stereo
+                // path; a right-local idx must never index the left-only array.
+                if(!pKF->mpCamera2 && pKF->mvuRight[idx]>=0)
                 {
                     // Check reprojection error in stereo
                     const float &kpx = kp.pt.x;
