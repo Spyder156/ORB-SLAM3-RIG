@@ -4137,16 +4137,42 @@ bool Tracking::TrackLocalMap()
         }
         else
         {
-            // if(!mbMapUpdated && mState == OK) //  && (mnMatchesInliers>30))
-            if(!mbMapUpdated) //  && (mnMatchesInliers>30))
+            // SELECT BY PRECONDITION, NOT BY mbMapUpdated. Upstream picks the
+            // optimizer from a flag set by another thread, so which numerical
+            // path runs depends on timing -- and the LastFrame variant needs a
+            // frame prior (mpcpi) and BOTH preintegrations, which may not exist.
+            // Missing inputs are what produce the NaN states we have been
+            // chasing. Check the inputs, and fall back to visual-only.
+            const IMU::Preintegrated* frameIntegration = mCurrentFrame.mpImuPreintegratedFrame;
+            const IMU::Preintegrated* keyFrameIntegration = mCurrentFrame.mpImuPreintegrated;
+            const bool hasFrameIntegration = frameIntegration &&
+                    std::isfinite(frameIntegration->dT) && frameIntegration->dT > 0.0f;
+            const bool hasKeyFrameIntegration = keyFrameIntegration &&
+                    std::isfinite(keyFrameIntegration->dT) && keyFrameIntegration->dT > 0.0f;
+            const Frame* previousFrame = mCurrentFrame.mpPrevFrame;
+            // LastFrame also reads bias-random-walk covariance from the keyframe
+            // integration, so that pointer must exist too.
+            const bool hasFramePrior = previousFrame && previousFrame->mpcpi &&
+                    hasFrameIntegration && hasKeyFrameIntegration;
+            KeyFrame* previousKeyFrame = hasKeyFrameIntegration ? mCurrentFrame.mpLastKeyFrame : nullptr;
+            const bool hasKeyFrameAnchor = previousKeyFrame && !previousKeyFrame->isBad() &&
+                    previousKeyFrame->GetMap() == mpAtlas->GetCurrentMap() &&
+                    hasKeyFrameIntegration;
+
+            if(!mbMapUpdated && hasFramePrior)
             {
                 Verbose::PrintMess("TLM: PoseInertialOptimizationLastFrame ", Verbose::VERBOSITY_DEBUG);
-                inliers = Optimizer::PoseInertialOptimizationLastFrame(&mCurrentFrame); // , !mpLastKeyFrame->GetMap()->GetIniertialBA1());
+                inliers = Optimizer::PoseInertialOptimizationLastFrame(&mCurrentFrame);
+            }
+            else if(hasKeyFrameAnchor)
+            {
+                Verbose::PrintMess("TLM: PoseInertialOptimizationLastKeyFrame ", Verbose::VERBOSITY_DEBUG);
+                inliers = Optimizer::PoseInertialOptimizationLastKeyFrame(&mCurrentFrame);
             }
             else
             {
-                Verbose::PrintMess("TLM: PoseInertialOptimizationLastKeyFrame ", Verbose::VERBOSITY_DEBUG);
-                inliers = Optimizer::PoseInertialOptimizationLastKeyFrame(&mCurrentFrame); // , !mpLastKeyFrame->GetMap()->GetIniertialBA1());
+                Verbose::PrintMess("TLM: PoseOptimization (inertial prior/integration unavailable)", Verbose::VERBOSITY_DEBUG);
+                inliers = Optimizer::PoseOptimization(&mCurrentFrame);
             }
         }
     }
